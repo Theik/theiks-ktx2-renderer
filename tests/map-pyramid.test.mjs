@@ -110,28 +110,25 @@ test("native Foundry background mesh names resolve to Level IDs", () => {
   assert.equal(resolveNativeLevelId({levelId: "future-api"}, levels), "future-api");
 });
 
-test("visible floors are the viewed level then every floor beneath it, nearest first", () => {
+test("visible floors follow Foundry's Level visibility state, nearest first", () => {
   const levels = [
-    {id: "ground", elevation: {bottom: 0}, sort: 300000},
-    {id: "first", elevation: {bottom: 10}, sort: 250000},
-    {id: "roof", elevation: {bottom: 20}, sort: 200000},
-    {id: "basement", elevation: {bottom: -10}, sort: 400000},
-    {id: "oubliette", elevation: {bottom: -40}, sort: 500000}
+    {id: "ground", elevation: {bottom: 0}, sort: 300000, isVisible: true},
+    {id: "first", elevation: {bottom: 10}, sort: 250000, isVisible: true},
+    {id: "roof", elevation: {bottom: 20}, sort: 200000, isVisible: true},
+    {id: "basement", elevation: {bottom: -10}, sort: 400000, isVisible: false},
+    {id: "oubliette", elevation: {bottom: -40}, sort: 500000, isVisible: false}
   ];
   assert.deepEqual(
     orderedVisibleLevelIds(levels, "roof"),
-    ["roof", "first", "ground", "basement", "oubliette"]
+    ["roof", "first", "ground"]
   );
-  assert.deepEqual(
-    orderedVisibleLevelIds(levels, "first"),
-    ["first", "ground", "basement", "oubliette"]
-  );
-  assert.deepEqual(orderedVisibleLevelIds(levels, "oubliette"), ["oubliette"]);
-  const visible = visibleSceneLevelIds(levels, "ground");
+  const visible = visibleSceneLevelIds(levels, "roof");
   assert.equal(visible.size, 3);
+  assert.ok(visible.has("roof"));
+  assert.ok(visible.has("first"));
   assert.ok(visible.has("ground"));
-  assert.ok(visible.has("basement"));
-  assert.ok(!visible.has("first"));
+  assert.ok(!visible.has("basement"));
+  assert.ok(!visible.has("oubliette"));
 });
 
 test("byte LRU evicts old unpinned entries and preserves pinned entries", () => {

@@ -64,16 +64,15 @@ export function orderedVisibleLevelIds(levels, activeLevelId) {
   const list = [...levels];
   const active = list.find(level => level?.id === activeLevelId);
   if (!active) return activeLevelId ? [activeLevelId] : [];
-  const activeBottom = levelBottomElevation(active);
-  const underneath = list
-    .filter(level => level?.id && level.id !== active.id && levelBottomElevation(level) < activeBottom)
+  const related = list
+    .filter(level => level?.id && level.id !== active.id && level.isVisible)
     .sort((left, right) => {
       const byElevation = levelBottomElevation(right) - levelBottomElevation(left);
       if (byElevation) return byElevation;
       return Number(left.sort ?? 0) - Number(right.sort ?? 0);
     })
     .map(level => level.id);
-  return [active.id, ...underneath];
+  return [active.id, ...related];
 }
 
 export function visibleSceneLevelIds(levels, activeLevelId) {

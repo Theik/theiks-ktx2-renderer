@@ -79,6 +79,7 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
   displayedTiers = new Map();
   activeTier = null;
   activeLevelId = null;
+  visibleLevelIds = new Set();
   warningShown = false;
   viewScale = 1;
   refreshTimer = null;
@@ -144,6 +145,9 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
     this.registerHook("updateScene", document => {
       if (document.id === this.scene.id) this.requestRefresh();
     });
+    this.registerHook("updateLevel", document => {
+      if (document.parent?.id === this.scene.id) this.requestRefresh();
+    });
   }
 
   async _onTearDown() {
@@ -158,6 +162,7 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
     this.records.clear();
     this.cache.clear();
     this.displayedTiers.clear();
+    this.visibleLevelIds.clear();
     for (const container of this.containers.values()) container.destroy({children: true});
     this.containers.clear();
     await Promise.allSettled(this.unloadingPaths.values());
@@ -378,8 +383,12 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
     return tiles.every(tile => this.records.has(this.#tileKey(levelId, tierId, tile.id)));
   }
 
-  #isCurrentViewReady(activeId, requestedTier, pinned) {
+  #isCurrentViewReady(activeId, requestedTier, pinned, visibleLevelIds) {
     if (this.activeLevelId !== activeId || this.activeTier !== requestedTier) return false;
+    if (this.visibleLevelIds.size !== visibleLevelIds.size) return false;
+    for (const levelId of visibleLevelIds) {
+      if (!this.visibleLevelIds.has(levelId)) return false;
+    }
     if ((this.displayedTiers.get(activeId) ?? "z0") !== requestedTier) return false;
     const activePrefix = `${activeId}/`;
     for (const key of pinned) {
@@ -409,7 +418,7 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
       this.#pinLevelFallback(levelId, pinned);
       if (requestedTier !== "z0") this.#pinVisibleTiles(levelId, requestedTier, viewport, pinned);
     }
-    if (this.#isCurrentViewReady(active.id, requestedTier, pinned)) return;
+    if (this.#isCurrentViewReady(active.id, requestedTier, pinned, visibleSet)) return;
 
     const generation = this.generations.next();
 
@@ -429,6 +438,7 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
       if (!nearerShowing) container.visible = false;
       this.#hideNativeMesh(levelId);
     }
+    this.visibleLevelIds = visibleSet;
     const activeLevel = this.manifest.levels.find(level => level.id === active.id);
     if (!activeLevel) return;
     await this.#ensureLevelFallback(active.id, pinned, generation);
@@ -686,6 +696,7 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
     console.error(`${MODULE_ID} | High-resolution map streaming failed.`, error);
     this.#restoreAllNativeMeshes();
     for (const container of this.containers.values()) container.visible = false;
+    this.visibleLevelIds.clear();
     if (!this.warningShown && game.user?.isGM) {
       ui.notifications.warn(`High-resolution map streaming failed on ${this.#sceneLabel()}. Foundry restored the low-resolution backgrounds; check the console for details.`);
       this.warningShown = true;

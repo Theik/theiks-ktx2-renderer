@@ -8,7 +8,15 @@ import archiver from "archiver";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DIST = path.join(ROOT, "dist");
 const RELEASE_DIRECTORIES = ["scripts", "tools", "examples", ".agents"];
-const RELEASE_FILES = ["module.json", "package.json", "package-lock.json", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"];
+const RELEASE_FILES = [
+  "module.json",
+  "package.json",
+  "package-lock.json",
+  "README.md",
+  "PATCHNOTES.md",
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md"
+];
 
 async function exists(target) {
   try {
