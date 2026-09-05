@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "scene": {
+    "width": 4000,
+    "height": 3000,
+    "padding": 0.25,
+    "gridSize": 100,
+    "masterWidth": 8000,
+    "masterHeight": 6000,
+    "masterGridSize": 200
+  },
+  "encoder": {
+    "name": "KTX-Software",
+    "version": "4.4.2",
+    "primaryEncoding": "uastc",
+    "mipLevels": 1,
+    "minimumSsim": 0.96,
+    "uastcQuality": 2,
+    "zstdLevel": 18
+  },
+  "tiers": [
+    {
+      "id": "z0",
+      "gridPixels": 50,
+      "columns": [40],
+      "rows": [30],
+      "gutter": 2
+    },
+    {
+      "id": "z1",
+      "gridPixels": 100,
+      "columns": [40],
+      "rows": [30],
+      "gutter": 2
+    },
+    {
+      "id": "z2",
+      "gridPixels": 200,
+      "columns": [20, 20],
+      "rows": [15, 15],
+      "gutter": 4
+    }
+  ],
+  "levels": [
+    {
+      "id": "level-one",
+      "name": "Level One",
+      "slug": "level-one",
+      "master": "level-one.webp"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "theiks-ktx2-renderer",
+  "title": "Theik's KTX2 Renderer",
+  "description": "Stream Foundry v14 battle maps from a KTX2 image pyramid, and give map makers a CLI to build those pyramids from high-resolution masters.",
+  "version": "1.0.0",
+  "authors": [
+    {
+      "name": "Theik",
+      "url": "https://github.com/Theik"
+    }
+  ],
+  "compatibility": {
+    "minimum": "14.365",
+    "verified": "14.539",
+    "maximum": "14.999"
+  },
+  "esmodules": [
+    "scripts/ktx2-renderer.js"
+  ],
+  "url": "https://github.com/Theik/theiks-ktx2-renderer",
+  "manifest": "https://github.com/Theik/theiks-ktx2-renderer/releases/latest/download/module.json",
+  "download": "https://github.com/Theik/theiks-ktx2-renderer/releases/download/v1.0.0/theiks-ktx2-renderer.zip",
+  "bugs": "https://github.com/Theik/theiks-ktx2-renderer/issues",
+  "readme": "https://github.com/Theik/theiks-ktx2-renderer/blob/main/README.md",
+  "license": "LICENSE"
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Prepare pyramid.json"
+  short_description: "Author a KTX2 pyramid.json from a Scene and masters"
+  default_prompt: "$ktx2-pyramid-json\nScene JSON: packs/maps/MyDungeon.json\nMasters: assets/masters\nWrite: tools/maps/my-dungeon-pyramid.json\nDo not rebuild KTX2."
+policy:
+  allow_implicit_invocation: true

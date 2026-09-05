@@ -1,0 +1,10 @@
+# IDE and operating-system files
+/.idea/
+.DS_Store
+Thumbs.db
+
+# Development dependencies and generated releases
+/node_modules/
+/dist/
+/.tools/
+/.map-staging/
