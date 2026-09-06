@@ -1,7 +1,9 @@
 import {readdir, readFile, writeFile} from "node:fs/promises";
 import path from "node:path";
 
-import {createTileLayout} from "./pyramid-lib.mjs";
+import {createTileLayout, preferredGutter, resolveTierGutter} from "./pyramid-lib.mjs";
+
+export {preferredGutter};
 
 export const USAGE = `Usage: node tools/propose-pyramid.mjs --scene <scene.json> [--masters <dir>] [--out <pyramid.json>]
    or: --width --height --grid-size [--padding] [--master-grid-size] [--master-width] [--master-height]
@@ -52,19 +54,6 @@ export function parseCli(argv) {
 export function pickGridPixels(gridSize, masterGridSize) {
   const z0 = Number.isInteger(gridSize / 2) ? gridSize / 2 : gridSize;
   return {z0, z1: gridSize, z2: masterGridSize};
-}
-
-export function preferredGutter(gridPixels, masterGridSize) {
-  const scale = gridPixels / masterGridSize;
-  if (!Number.isFinite(scale) || scale <= 0) {
-    throw new Error("gridPixels must be a positive fraction of masterGridSize.");
-  }
-  const preferred = 4 * scale;
-  if (Number.isInteger(preferred) && preferred >= 1) return preferred;
-  for (let gutter = 1; gutter <= 32; gutter += 1) {
-    if (Number.isInteger(gutter / scale)) return gutter;
-  }
-  throw new Error(`No gutter maps ${gridPixels} px/cell back to whole master pixels at ${masterGridSize} px/cell.`);
 }
 
 function integerSourceGutters(gridPixels, masterGridSize, max = 16) {
@@ -148,7 +137,9 @@ export function proposeTier(id, sceneColumns, sceneRows, gridPixels, masterGridS
   if (!best) {
     throw new Error(`No ${id} gutter can tile ${sceneColumns}x${sceneRows} cells at ${gridPixels} px/cell.`);
   }
-  return {id: best.id, gridPixels: best.gridPixels, columns: best.columns, rows: best.rows, gutter: best.gutter};
+  const tier = {id: best.id, gridPixels: best.gridPixels, columns: best.columns, rows: best.rows};
+  resolveTierGutter({scene: {masterGridSize}}, tier);
+  return tier;
 }
 
 export function proposeTiers(sceneColumns, sceneRows, gridSize, masterGridSize) {
@@ -364,8 +355,9 @@ async function main() {
 
   for (const tier of config.tiers) {
     const tiles = createTileLayout(config, tier);
+    const gutter = resolveTierGutter(config, tier);
     const max = Math.max(...tiles.map(tile => Math.max(tile.pixel.width, tile.pixel.height)));
-    console.error(`${tier.id}: ${tiles.length} tiles, gutter ${tier.gutter}, max ${max} px`);
+    console.error(`${tier.id}: ${tiles.length} tiles, derived gutter ${gutter}, max ${max} px`);
   }
 }
 

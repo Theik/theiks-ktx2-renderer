@@ -24,6 +24,7 @@ import {
   posixJoin,
   premultiplyRgba,
   readKtx2Header,
+  resolveTierGutter,
   runProcess,
   sha256File,
   sha256Json
@@ -289,6 +290,7 @@ async function buildLevel(ctx, level, ktxCli, stagingRoot, masterInfo, rebuildTi
         continue;
       }
       const tierRoot = path.join(levelRoot, tier.id);
+      const gutter = resolveTierGutter(ctx.config, tier);
       await mkdir(tierRoot, {recursive: true});
       const tileEntries = [];
       for (const tile of createTileLayout(ctx.config, tier)) {
@@ -317,7 +319,7 @@ async function buildLevel(ctx, level, ktxCli, stagingRoot, masterInfo, rebuildTi
         id: tier.id,
         gridPixels: tier.gridPixels,
         density: tier.gridPixels / ctx.config.scene.gridSize,
-        gutter: tier.gutter,
+        gutter,
         tiles: tileEntries
       });
     }
@@ -359,7 +361,8 @@ async function readExistingManifest(ctx) {
 async function generatedTierMatches(ctx, level, configuredTier) {
   const tier = level?.tiers?.find(candidate => candidate.id === configuredTier.id);
   const expectedTiles = createTileLayout(ctx.config, configuredTier);
-  if (!tier || tier.tiles?.length !== expectedTiles.length || tier.gutter !== configuredTier.gutter) return false;
+  const gutter = resolveTierGutter(ctx.config, configuredTier);
+  if (!tier || tier.tiles?.length !== expectedTiles.length || tier.gutter !== gutter) return false;
   for (const expectedTile of expectedTiles) {
     const tile = tier.tiles.find(candidate => candidate.id === expectedTile.id);
     if (!tile?.path?.startsWith(ctx.modulePrefix) || !tile.sha256) return false;

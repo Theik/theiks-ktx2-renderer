@@ -36,9 +36,9 @@ const config = {
 };
 
 const tiers = {
-  z0: {id: "z0", gridPixels: 50, columns: [67], rows: [65], gutter: 1},
-  z1: {id: "z1", gridPixels: 100, columns: [34, 33], rows: [33, 32], gutter: 2},
-  z2: {id: "z2", gridPixels: 200, columns: [17, 17, 17, 16], rows: [17, 16, 16, 16], gutter: 4}
+  z0: {id: "z0", gridPixels: 50, columns: [67], rows: [65]},
+  z1: {id: "z1", gridPixels: 100, columns: [34, 33], rows: [33, 32]},
+  z2: {id: "z2", gridPixels: 200, columns: [17, 17, 17, 16], rows: [17, 16, 16, 16]}
 };
 
 test("tile layouts preserve odd grid dimensions and safe texture sizes", () => {

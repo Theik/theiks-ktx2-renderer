@@ -40,6 +40,86 @@ export function expectedMipCount(width, height) {
   return Math.floor(Math.log2(Math.max(width, height))) + 1;
 }
 
+function gutterOutputScale(config, tier) {
+  const masterGridSize = Number(config.scene.masterGridSize);
+  const gridPixels = Number(tier.gridPixels);
+  const outputScale = gridPixels / masterGridSize;
+  if (!Number.isFinite(masterGridSize) || masterGridSize <= 0
+    || !Number.isFinite(gridPixels) || gridPixels <= 0
+    || !Number.isFinite(outputScale) || outputScale <= 0) {
+    throw new Error(`${tier.id}: gridPixels and masterGridSize must define a positive output scale.`);
+  }
+  return outputScale;
+}
+
+function physicalSize(cells, gridPixels, gutter) {
+  return cells * gridPixels + (2 * gutter);
+}
+
+function tierCells(tier) {
+  if (!Array.isArray(tier.columns) || !tier.columns.length || !Array.isArray(tier.rows) || !tier.rows.length) {
+    throw new Error(`${tier.id}: columns and rows must be non-empty arrays.`);
+  }
+  const cells = [...tier.columns, ...tier.rows];
+  if (!cells.every(value => Number.isInteger(value) && value > 0)) {
+    throw new Error(`${tier.id}: columns and rows must contain positive integers.`);
+  }
+  return cells;
+}
+
+function gutterFitsTier(tier, cells, gutter, outputScale) {
+  if (!Number.isInteger(gutter) || gutter < 1 || !Number.isInteger(gutter / outputScale)) return false;
+  return cells.every(cellCount => {
+    const physical = physicalSize(cellCount, tier.gridPixels, gutter);
+    return physical > 0 && physical < 4096 && physical % 4 === 0;
+  });
+}
+
+export function preferredGutter(gridPixels, masterGridSize) {
+  const numericGridPixels = Number(gridPixels);
+  const numericMasterGridSize = Number(masterGridSize);
+  const outputScale = numericGridPixels / numericMasterGridSize;
+  if (!Number.isFinite(numericGridPixels) || numericGridPixels <= 0
+    || !Number.isFinite(numericMasterGridSize) || numericMasterGridSize <= 0
+    || !Number.isFinite(outputScale) || outputScale <= 0) {
+    throw new Error("gridPixels and masterGridSize must define a positive output scale.");
+  }
+  return 4 * outputScale;
+}
+
+export function resolveTierGutter(config, tier) {
+  const outputScale = gutterOutputScale(config, tier);
+  const cells = tierCells(tier);
+  if (tier.gutter !== undefined) {
+    if (!Number.isInteger(tier.gutter) || tier.gutter < 1) {
+      throw new Error(`${tier.id}: gutter must be a positive integer.`);
+    }
+    if (!Number.isInteger(tier.gutter / outputScale)) {
+      throw new Error(`${tier.id}: gutter ${tier.gutter} does not map to whole master pixels.`);
+    }
+    if (!gutterFitsTier(tier, cells, tier.gutter, outputScale)) {
+      throw new Error(`${tier.id}: gutter ${tier.gutter} does not keep every tile under 4096 pixels and aligned to 4x4 blocks.`);
+    }
+    return tier.gutter;
+  }
+
+  const largestCells = Math.max(...cells);
+  const maxGutter = Math.floor((4095 - (largestCells * tier.gridPixels)) / 2);
+  const preferred = preferredGutter(tier.gridPixels, config.scene.masterGridSize);
+  let best;
+  for (let gutter = 1; gutter <= maxGutter; gutter += 1) {
+    if (!gutterFitsTier(tier, cells, gutter, outputScale)) continue;
+    const score = [Math.abs(gutter - preferred), gutter];
+    if (!best || score[0] < best.score[0] || (score[0] === best.score[0] && score[1] < best.score[1])) {
+      best = {gutter, score};
+    }
+  }
+  if (!best) {
+    throw new Error(`${tier.id}: columns and rows cannot use a common automatic gutter. Re-run tools/propose-pyramid.mjs to generate compatible partitions.`);
+  }
+  return best.gutter;
+}
+
 export function createTileLayout(config, tier) {
   const sceneColumns = config.scene.width / config.scene.gridSize;
   const sceneRows = config.scene.height / config.scene.gridSize;
@@ -51,10 +131,8 @@ export function createTileLayout(config, tier) {
   const rowOffsets = cumulativeOffsets(tier.rows);
   const sourceScale = config.scene.masterGridSize;
   const outputScale = tier.gridPixels / sourceScale;
-  const sourceGutter = tier.gutter / outputScale;
-  if (!Number.isInteger(sourceGutter)) {
-    throw new Error(`${tier.id}: gutter ${tier.gutter} does not map to whole master pixels.`);
-  }
+  const gutter = resolveTierGutter(config, tier);
+  const sourceGutter = gutter / outputScale;
 
   const tiles = [];
   for (let row = 0; row < tier.rows.length; row += 1) {
@@ -71,10 +149,10 @@ export function createTileLayout(config, tier) {
       const cropY = Math.max(0, sourceY - sourceGutter);
       const cropRight = Math.min(config.scene.masterWidth, sourceX + sourceWidth + sourceGutter);
       const cropBottom = Math.min(config.scene.masterHeight, sourceY + sourceHeight + sourceGutter);
-      const leftPad = sourceX === 0 ? tier.gutter : 0;
-      const topPad = sourceY === 0 ? tier.gutter : 0;
-      const rightPad = sourceX + sourceWidth === config.scene.masterWidth ? tier.gutter : 0;
-      const bottomPad = sourceY + sourceHeight === config.scene.masterHeight ? tier.gutter : 0;
+      const leftPad = sourceX === 0 ? gutter : 0;
+      const topPad = sourceY === 0 ? gutter : 0;
+      const rightPad = sourceX + sourceWidth === config.scene.masterWidth ? gutter : 0;
+      const bottomPad = sourceY + sourceHeight === config.scene.masterHeight ? gutter : 0;
       const contentWidth = gridWidth * tier.gridPixels;
       const contentHeight = gridHeight * tier.gridPixels;
 
@@ -104,10 +182,10 @@ export function createTileLayout(config, tier) {
           height: Math.round((cropBottom - cropY) * outputScale)
         },
         extend: {left: leftPad, top: topPad, right: rightPad, bottom: bottomPad},
-        frame: {x: tier.gutter, y: tier.gutter, width: contentWidth, height: contentHeight},
+        frame: {x: gutter, y: gutter, width: contentWidth, height: contentHeight},
         pixel: {
-          width: contentWidth + (2 * tier.gutter),
-          height: contentHeight + (2 * tier.gutter)
+          width: contentWidth + (2 * gutter),
+          height: contentHeight + (2 * gutter)
         }
       });
     }

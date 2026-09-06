@@ -23,22 +23,19 @@
       "id": "z0",
       "gridPixels": 50,
       "columns": [40],
-      "rows": [30],
-      "gutter": 2
+      "rows": [30]
     },
     {
       "id": "z1",
       "gridPixels": 100,
       "columns": [40],
-      "rows": [30],
-      "gutter": 2
+      "rows": [30]
     },
     {
       "id": "z2",
       "gridPixels": 200,
       "columns": [20, 20],
-      "rows": [15, 15],
-      "gutter": 4
+      "rows": [15, 15]
     }
   ],
   "levels": [

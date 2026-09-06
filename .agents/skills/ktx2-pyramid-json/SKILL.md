@@ -1,14 +1,14 @@
 ---
 name: ktx2-pyramid-json
 description: >-
-  Prepares a pyramid.json for Theik's KTX2 Renderer from a Foundry Scene and RGBA WebP masters. Use when creating a map-module pyramid config, generating pyramid.json, choosing z0/z1/z2 columns rows and gutters, or when a map developer asks to author a KTX2 pyramid layout from scene size and masters.
+  Prepares a pyramid.json for Theik's KTX2 Renderer from a Foundry Scene and RGBA WebP masters. Use when creating a map-module pyramid config, generating pyramid.json, choosing z0/z1/z2 columns and rows, or when a map developer asks to author a KTX2 pyramid layout from scene size and masters.
 ---
 
 # Prepare pyramid.json
 
 Author `pyramid.json` only. Do not rebuild KTX2, call `ktx`, or invent encoder settings unless the user asks for a rebuild after the config exists.
 
-The encoder and 4×4 layout math live in this renderer. Run `tools/propose-pyramid.mjs`. Do not hand-edit `columns`, `rows`, `gutter`, or `gridPixels` unless `doctor` fails afterward.
+The encoder and 4×4 layout math live in this renderer. Run `tools/propose-pyramid.mjs`. Do not hand-edit `columns`, `rows`, or `gridPixels` unless `doctor` fails afterward. New configs omit `gutter`; the Node tooling derives it.
 
 ## Renderer root
 
@@ -56,13 +56,13 @@ If they pasted a prompt with "this Scene" / "these masters" and no paths, ask fo
      --output <ktx2-output-dir> --module-id <foundryModuleId>
    ```
 
-5. Show the user the written path, cell counts, and each tier's tile count / gutter / max pixel size from the proposer stderr. Copy the `encoder` object as emitted. Do not change `mipLevels`, `primaryEncoding`, `uastcQuality`, or `zstdLevel`.
+5. Show the user the written path, cell counts, and each tier's tile count, derived gutter, and max pixel size from the proposer stderr. Copy the `encoder` object as emitted. Do not change `mipLevels`, `primaryEncoding`, `uastcQuality`, or `zstdLevel`.
 6. Stop. Rebuild with `tools/pyramid.mjs rebuild` only when the user asks.
 
 ## Guardrails
 
 - `levels[].master` is a filename in `--masters` (`ground-floor.webp`), not a module path.
 - Keep `schemaVersion: 1` and three tiers `z0`, `z1`, `z2`.
-- Physical tile size is `(cells × gridPixels) + (2 × gutter)`. It must stay **under 4096** and **divisible by 4**. The proposer already enforces that through `createTileLayout`.
+- Physical tile size is `(cells × gridPixels) + (2 × gutter)`. It must stay **under 4096** and **divisible by 4**. The proposer and build tooling derive the gutter through `resolveTierGutter`.
 - Encoding rules (KTX-Software 4.4.2, UASTC, one mip, Sharp premultiply + DFD flag, never RGBA8) stay in the renderer. Do not fork them into the map module.
-- If `doctor` reports a 4×4 or master-dimension error, fix Scene size, master size, or re-run the proposer. Do not patch a single gutter by guesswork.
+- If `doctor` reports a 4×4, partition, or master-dimension error, fix the Scene size, master size, or re-run the proposer. Do not add a gutter by guesswork.
