@@ -110,6 +110,21 @@ test("150 px grids with 300 px masters use 75/150/300 output pixels", () => {
   }
 });
 
+test("larger masters receive additional density tiers with sequential IDs", () => {
+  const tiers = proposeTiers(40, 30, 100, 800);
+  assert.deepEqual(tiers.map(tier => tier.id), ["z0", "z1", "z2", "z3", "z4"]);
+  assert.deepEqual(tiers.map(tier => tier.gridPixels), [50, 100, 200, 400, 800]);
+});
+
+test("oversized roots reduce density until the full Scene fits one aligned texture", () => {
+  const tiers = proposeTiers(100, 100, 100, 800);
+  assert.ok(tiers[0].gridPixels < 50);
+  assert.equal(tiers[0].columns.length, 1);
+  assert.equal(tiers[0].rows.length, 1);
+  assert.equal(tiers.at(-1).gridPixels, 800);
+  assert.deepEqual(tiers.map((tier, index) => tier.id), tiers.map((_, index) => `z${index}`));
+});
+
 test("splitDimension prefers equal parts that already fit", () => {
   assert.deepEqual(splitDimension(40, 50, 2), [40]);
   assert.deepEqual(splitDimension(67, 200, 4), [17, 17, 17, 16]);

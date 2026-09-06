@@ -5,20 +5,30 @@ import path from "node:path";
 import {
   ByteLruCache,
   canvasRectToSceneRect,
+  contentFrameIsTransparent,
   createTileLayout,
   expectedMipCount,
   KTX2_IDENTIFIER,
   markKtxPremultiplied,
   masterFilename,
   parseOverallSsim,
+  performanceLoadConcurrency,
   posixJoin,
   premultiplyRgba,
+  PriorityLoadQueue,
+  QueueCancelledError,
+  resolveDisplaySlot,
   resolveNativeLevelId,
   RequestGeneration,
   scenePointToCanvasPoint,
   selectLod,
+  selectTileDemand,
   selectVisibleTiles,
+  semanticTier,
   StaleRequestError,
+  retryDelay,
+  validateAscendingTierDensities,
+  validateManifestTileEntry,
   orderedVisibleLevelIds,
   visibleSceneLevelIds
 } from "../tools/pyramid-lib.mjs";
@@ -90,6 +100,52 @@ test("visible tile selection includes an optional neighboring ring", () => {
   assert.ok(withMargin.some(tile => tile.id === "1-1"));
 });
 
+test("visible and prefetched demand are separate", () => {
+  const layout = createTileLayout(config, tiers.z2);
+  const demand = selectTileDemand(layout, {x: 100, y: 100, width: 200, height: 200}, 1700);
+  assert.deepEqual(demand.visible.map(tile => tile.id), ["0-0"]);
+  assert.ok(demand.prefetched.some(tile => tile.id === "1-1"));
+  assert.ok(demand.prefetched.every(tile => tile.id !== "0-0"));
+});
+
+test("density-driven LOD handles five tiers and semantic settings", () => {
+  const ladder = [0.25, 0.5, 1, 2, 4].map((density, index) => ({id: `z${index}`, density}));
+  assert.equal(selectLod(0.44, null, "auto", ladder), "z1");
+  assert.equal(selectLod(0.45, "z1", "auto", ladder), "z2");
+  assert.equal(selectLod(0.76, "z3", "auto", ladder), "z2");
+  assert.equal(semanticTier(ladder, "z0"), "z0");
+  assert.equal(semanticTier(ladder, "z1"), "z2");
+  assert.equal(semanticTier(ladder, "z2"), "z4");
+  const tied = [{id: "low", density: 0.75}, {id: "high", density: 1.25}];
+  assert.equal(semanticTier(tied, "z1"), "high");
+  assert.throws(() => validateAscendingTierDensities([ladder[1], ladder[0]]), /strictly ascending/);
+});
+
+test("fallback slots crop multiple root tiles without target overlap", () => {
+  const roots = [
+    {id: "left", scene: {x: 0, y: 0, width: 100, height: 100}, frame: {x: 2, y: 2, width: 50, height: 50}},
+    {id: "right", scene: {x: 100, y: 0, width: 100, height: 100}, frame: {x: 2, y: 2, width: 50, height: 50}}
+  ];
+  const target = {id: "wide", scene: {x: 50, y: 0, width: 100, height: 100}, frame: {x: 4, y: 4, width: 100, height: 100}};
+  const ladder = [{id: "z0", density: 0.5, tiles: roots}, {id: "z1", density: 1, tiles: [target]}];
+  const rootKeys = new Set(["floor/z0/left", "floor/z0/right"]);
+  const fallback = resolveDisplaySlot("floor", ladder, "z1", target, rootKeys);
+  assert.equal(fallback.mode, "fallback");
+  assert.deepEqual(fallback.pieces.map(piece => piece.scene), [
+    {x: 50, y: 0, width: 50, height: 100},
+    {x: 100, y: 0, width: 50, height: 100}
+  ]);
+  assert.deepEqual(fallback.pieces.map(piece => piece.frame), [
+    {x: 27, y: 2, width: 25, height: 50},
+    {x: 2, y: 2, width: 25, height: 50}
+  ]);
+  const targetSlot = resolveDisplaySlot("floor", ladder, "z1", target, new Set([...rootKeys, "floor/z1/wide"]));
+  assert.equal(targetSlot.mode, "target");
+  assert.equal(targetSlot.pieces.length, 1);
+  assert.equal(targetSlot.pieces.some(piece => piece.key?.includes("/z0/")), false);
+  assert.equal(resolveDisplaySlot("floor", ladder, "z1", {...target, blank: true}, rootKeys).mode, "blank");
+});
+
 test("scene padding offsets tile placement and viewport selection", () => {
   const sceneRect = {x: 670, y: 650, width: 6700, height: 6500};
   const canvasViewport = {x: 4070, y: 3950, width: 800, height: 600};
@@ -142,6 +198,50 @@ test("byte LRU evicts old unpinned entries and preserves pinned entries", () => 
   assert.ok(cache.get("c"));
 });
 
+test("load queue honors concurrency, reprioritization, cancellation, and in-flight completion", async () => {
+  const queue = new PriorityLoadQueue(1);
+  const order = [];
+  let release;
+  const blocker = queue.enqueue("active", 0, () => new Promise(resolve => { release = resolve; }));
+  await new Promise(resolve => setImmediate(resolve));
+  const cancelled = queue.enqueue("obsolete", 4, async () => order.push("obsolete"));
+  const visible = queue.enqueue("visible", 2, async () => order.push("visible"));
+  queue.setPriority("visible", 1);
+  queue.cancelWhere(entry => entry.key === "obsolete" || entry.key === "active");
+  await assert.rejects(cancelled, QueueCancelledError);
+  assert.equal(queue.inFlightCount, 1);
+  release("cached");
+  assert.equal(await blocker, "cached");
+  await visible;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(order, ["visible"]);
+  assert.equal(queue.queuedCount, 0);
+  assert.equal(queue.inFlightCount, 0);
+});
+
+test("performance modes select one, two, or four concurrent loads", () => {
+  assert.equal(performanceLoadConcurrency(0), 1);
+  assert.equal(performanceLoadConcurrency("Low"), 1);
+  assert.equal(performanceLoadConcurrency(1), 2);
+  assert.equal(performanceLoadConcurrency("Medium"), 2);
+  assert.equal(performanceLoadConcurrency(2), 4);
+  assert.equal(performanceLoadConcurrency("Maximum"), 4);
+});
+
+test("load queue does not exceed its concurrency limit", async () => {
+  const queue = new PriorityLoadQueue(2);
+  let active = 0;
+  let maximum = 0;
+  const tasks = Array.from({length: 5}, (_, index) => queue.enqueue(`tile-${index}`, index, async () => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active -= 1;
+  }));
+  await Promise.all(tasks);
+  assert.equal(maximum, 2);
+});
+
 test("request generations reject stale asynchronous results", () => {
   const generations = new RequestGeneration();
   const first = generations.next();
@@ -156,6 +256,25 @@ test("RGBA premultiplication preserves alpha and clears transparent color", () =
   const pixels = Buffer.from([100, 50, 25, 128, 200, 100, 50, 0, 10, 20, 30, 255]);
   premultiplyRgba(pixels);
   assert.deepEqual([...pixels], [50, 25, 13, 128, 0, 0, 0, 0, 10, 20, 30, 255]);
+});
+
+test("sparse alpha inspection ignores gutters and preserves partial alpha", () => {
+  const pixels = Buffer.alloc(4 * 4 * 4);
+  pixels[3] = 255;
+  const content = {x: 1, y: 1, width: 2, height: 2};
+  assert.equal(contentFrameIsTransparent(pixels, 4, 4, content), true);
+  pixels[((1 * 4) + 1) * 4 + 3] = 1;
+  assert.equal(contentFrameIsTransparent(pixels, 4, 4, content), false);
+  pixels[((1 * 4) + 1) * 4 + 3] = 128;
+  assert.equal(contentFrameIsTransparent(pixels, 4, 4, content), false);
+});
+
+test("blank manifest entries keep geometry and reject asset metadata", () => {
+  const geometry = {id: "0-0", scene: {x: 0, y: 0, width: 10, height: 10}, pixel: {width: 12, height: 12}, frame: {x: 1, y: 1, width: 10, height: 10}};
+  assert.doesNotThrow(() => validateManifestTileEntry({...geometry, blank: true}));
+  assert.throws(() => validateManifestTileEntry({...geometry, blank: true, path: "tile.ktx2"}), /asset fields/);
+  assert.doesNotThrow(() => validateManifestTileEntry({...geometry, path: "tile.ktx2"}));
+  assert.deepEqual([1, 2, 3, 4].map(retryDelay), [5000, 15000, 60000, 60000]);
 });
 
 test("KTX2 premultiplied flag patch only changes the DFD flag", () => {

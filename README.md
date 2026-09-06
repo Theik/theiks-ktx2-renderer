@@ -40,11 +40,11 @@
   <tr>
     <td width="50%">
       <h3>Runtime LOD streaming</h3>
-      Any Scene flagged with <code>flags.theiks-ktx2-renderer.mapPyramid</code> loads a z0 / z1 / z2 KTX2 pyramid. Foundry only transcodes the tiles needed for the current level and viewport.
+      Any Scene flagged with <code>flags.theiks-ktx2-renderer.mapPyramid</code> loads a density-based KTX2 pyramid. Tiles preload around the viewport, appear independently, and keep lower-density coverage in place while detail loads.
     </td>
     <td width="50%">
       <h3>Authoring CLI</h3>
-      <code>node tools/pyramid.mjs</code> turns RGBA WebP masters into UASTC KTX2 tiles, a manifest, and a thumbnail. The Foundry zip includes <code>tools/</code> so map makers who installed from Foundry still have the CLI on disk.
+      <code>node tools/pyramid.mjs</code> turns image masters into UASTC KTX2 tiles, a manifest, and a thumbnail. The Foundry zip includes <code>tools/</code> so map makers who installed from Foundry still have the CLI on disk.
     </td>
   </tr>
 </table>
@@ -57,7 +57,9 @@
 4. Enable any map module that lists this renderer as a required dependency.
 5. Optionally open **Game Settings → Theik's KTX2 Renderer** and set **Map detail** to Auto, Low, Medium, or High for this browser.
 
-If a flagged Scene cannot stream, the GM sees an error naming the Scene. Native Foundry backgrounds remain as a fallback only after that message.
+Low selects the least-dense tier, Medium selects the tier nearest native Scene density, and High selects the densest tier. Auto follows zoom with hysteresis. These meanings stay the same when a pyramid contains more than three tiers.
+
+If a detail tile fails, its lower-density coverage remains visible and the renderer retries after 5 seconds, 15 seconds, then every 60 seconds while the tile is still needed. The GM receives one warning for the Scene and individual paths are written to the console. A missing manifest or required fallback is fatal, so the native Foundry backgrounds remain in place.
 
 ## Build or update your own map module
 
@@ -155,20 +157,24 @@ Then prepare the inputs:
 1. In Foundry, open the Scenes sidebar.
 2. Right-click the Scene and choose **Export Data**.
 3. Move the downloaded JSON file to `MODULE_FOLDER/packs-src/maps/MAP_NAME.json`.
-4. Export one WebP image for every floor in the Scene.
-5. Keep transparency enabled when exporting. The files must be RGBA WebPs, which means they contain red, green, blue, and transparency channels.
+4. Export one image for every floor in the Scene. Lossless WebP or PNG is recommended.
+5. Keep transparency enabled if the floor needs it. JPEG works, but it cannot store transparency and becomes fully opaque.
 6. Give every floor image the same width and height. Twice the Scene's pixel width and height is the usual choice.
-7. Put the WebPs in `MODULE_FOLDER/assets/masters/`.
+7. Put the images in `MODULE_FOLDER/assets/masters/`.
 
-Name each WebP after its Foundry Level. Use lowercase letters, replace spaces with hyphens, and remove punctuation:
+Name each image after its Foundry Level. Use lowercase letters, replace spaces with hyphens, and remove punctuation:
 
 ```text
-Ground Floor  → ground-floor.webp
-First Floor   → first-floor.webp
+Ground Floor  → ground-floor.png
+First Floor   → first-floor.jpg
 Roof          → roof.webp
 ```
 
-The next command reports the exact missing filename if one does not match.
+The next command reports the missing floor name if one does not match.
+
+The proposer accepts single-image formats that the installed Sharp build can read. These commonly include WebP, PNG, JPEG, AVIF, TIFF, GIF, and SVG. It matches Scene floors to master filenames by name, regardless of extension, then writes the actual filename to the recipe. Do not keep two masters with the same name and different extensions, such as both `roof.png` and `roof.jpg`; the proposer rejects that ambiguity. It also rejects animated and multi-page images.
+
+The builder converts every master to sRGB RGBA before it creates tiles. Sources without alpha, including JPEG, receive an opaque alpha channel. Existing transparency is preserved. Prefer a lossless source because JPEG artifacts remain in the final KTX2 and JPEG adds a second lossy compression step.
 
 ### 5. Create the map recipe
 
@@ -178,7 +184,7 @@ Stay in the `theiks-ktx2-renderer` terminal. Replace the three placeholders, the
 node tools/propose-pyramid.mjs --scene "../MODULE_FOLDER/packs-src/maps/MAP_NAME.json" --masters "../MODULE_FOLDER/assets/masters" --out "../MODULE_FOLDER/tools/maps/MAP_NAME-pyramid.json"
 ```
 
-This creates `MAP_NAME-pyramid.json`. It reads the Scene size, grid size, floors, and WebP dimensions. It also chooses all tile measurements. Do not copy `examples/pyramid.json` over this file.
+This creates `MAP_NAME-pyramid.json`. It reads the Scene size, grid size, floors, and master image dimensions. It also chooses all tile measurements. Do not copy `examples/pyramid.json` over this file.
 
 ### 6. Check everything before building
 
@@ -263,7 +269,7 @@ Commit `module.json`, the pyramid recipe, the edited Scene source, and the compl
 
 If only the artwork changed:
 
-1. Replace the matching WebP in `assets/masters/`. Keep its filename and dimensions unchanged.
+1. Replace the matching master image in `assets/masters/`. Keep its filename and dimensions unchanged.
 2. Run the `rebuild` command from step 7.
 3. Run `verify` from step 9.
 4. Commit the changed files in `assets/maps/MAP_NAME-pyramid/`.
@@ -271,7 +277,7 @@ If only the artwork changed:
 If the Scene size, grid size, floor names, or floor list changed:
 
 1. Export the Scene JSON again.
-2. Replace the WebP masters.
+2. Replace the master images.
 3. Repeat steps 5 through 9.
 
 Do not fix a failed build by guessing values in the recipe. Run the proposer again, then read the first error from `doctor`.
@@ -297,7 +303,7 @@ These are load-bearing. Wrong mip counts or unaligned sizes are what produce bla
 - KTX-Software CLI **exactly 4.4.2**. Foundry 14 transcodes UASTC to BC7 on common GPUs.
 - Every tile is **UASTC + Zstd**, **one mip level** (`mipLevels: 1`). Never `--generate-mipmap`, never a mip chain.
 - Every physical texture size must be **aligned to 4×4**. The tooling derives a gutter that aligns every configured tile in a tier and maps to whole master pixels.
-- Premultiply RGBA in Sharp, then set the KTX2 DFD premultiplied-alpha flag after `ktx create`. Version 4.4.2 cannot set that flag itself.
+- Convert each source to sRGB RGBA and premultiply it in Sharp, then set the KTX2 DFD premultiplied-alpha flag after `ktx create`. Version 4.4.2 cannot set that flag itself.
 - Keep UASTC when SSIM falls below 0.96. **Never** fall back to uncompressed `R8G8B8A8_SRGB` / `rgba8-zstd`; Foundry's KTX2 loader rejects it (`Invalid Asset`).
 - Tiles stay under 4096 px and under GitHub's 95 MiB file limit.
 
@@ -309,7 +315,11 @@ UASTC (and the BC7 format Foundry transcodes it to) compresses the image in **4�
 
 The mesh still uses the inner content rectangle. Gutter is only there so the file on disk is a valid compressed texture. A 100×50 content tile needs a physical size such as 100×52, not 100×50.
 
-Keep **one mip**. Each mipmap level must also be 4×4 aligned. A mip chain on a size that is not a multiple of 4 will fail. Zoom uses the z0 / z1 / z2 pyramid instead.
+Keep **one mip**. Each mipmap level must also be 4×4 aligned. A mip chain on a size that is not a multiple of 4 will fail. Zoom uses the density tiers in the pyramid instead.
+
+The proposer starts near half the Scene grid density, doubles through intermediate densities, and ends at the exact master density. A normal 2× master still produces `z0`, `z1`, and `z2` at densities 0.5, 1, and 2. Larger masters can produce `z3` and higher tiers.
+
+Fully transparent content tiles above the least-density tier are recorded as `blank: true` and have no KTX2 file. Transparency in a gutter does not determine whether a tile is blank. The least-density tier is always encoded so every floor has dependable fallback coverage. Existing schema-version-1 manifests without blank entries remain valid.
 
 ## Installation
 

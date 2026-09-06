@@ -2,12 +2,18 @@ import {readdir, readFile, writeFile} from "node:fs/promises";
 import path from "node:path";
 
 import {createTileLayout, preferredGutter, resolveTierGutter} from "./pyramid-lib.mjs";
+import {
+  inspectMasterImage,
+  isSupportedMasterFilename,
+  masterStem,
+  supportedMasterSuffixes
+} from "./master-image.mjs";
 
 export {preferredGutter};
 
 export const USAGE = `Usage: node tools/propose-pyramid.mjs --scene <scene.json> [--masters <dir>] [--out <pyramid.json>]
    or: --width --height --grid-size [--padding] [--master-grid-size] [--master-width] [--master-height]
-       [--level id:name:slug:file.webp]... [--masters <dir>] [--out <pyramid.json>]`;
+       [--level id:name:slug:filename.ext]... [--masters <dir>] [--out <pyramid.json>]`;
 
 export const ENCODER = {
   name: "KTX-Software",
@@ -143,8 +149,40 @@ export function proposeTier(id, sceneColumns, sceneRows, gridPixels, masterGridS
 }
 
 export function proposeTiers(sceneColumns, sceneRows, gridSize, masterGridSize) {
-  const pixels = pickGridPixels(gridSize, masterGridSize);
-  return ["z0", "z1", "z2"].map(id => proposeTier(id, sceneColumns, sceneRows, pixels[id], masterGridSize));
+  const preferredRoot = pickGridPixels(gridSize, masterGridSize).z0;
+  let rootPixels = preferredRoot;
+  const preferredNeedsReduction = Math.max(sceneColumns, sceneRows) * preferredRoot + 32 >= 4096;
+  if (preferredNeedsReduction) {
+    for (let candidate = preferredRoot; candidate >= 1; candidate -= 1) {
+      try {
+        const tier = proposeTier("root", sceneColumns, sceneRows, candidate, masterGridSize);
+        if (tier.columns.length === 1 && tier.rows.length === 1) {
+          rootPixels = candidate;
+          break;
+        }
+      } catch {
+        // Some densities cannot map a whole-pixel gutter back to the master.
+      }
+    }
+  }
+
+  const candidates = [];
+  for (let density = rootPixels; density < masterGridSize; density *= 2) candidates.push(density);
+  candidates.push(masterGridSize);
+  const unique = [...new Set(candidates)].sort((left, right) => left - right);
+  const tiers = [];
+  for (const gridPixels of unique) {
+    const required = gridPixels === masterGridSize;
+    try {
+      tiers.push(proposeTier(`z${tiers.length}`, sceneColumns, sceneRows, gridPixels, masterGridSize));
+    } catch (error) {
+      if (required) throw error;
+    }
+  }
+  if (!tiers.length || tiers.at(-1).gridPixels !== masterGridSize) {
+    throw new Error(`The master density ${masterGridSize} px/cell could not form a valid aligned layout.`);
+  }
+  return tiers;
 }
 
 export function validateProposedConfig(config) {
@@ -188,7 +226,7 @@ export function sceneLevels(scene) {
 
 export function parseLevelFlag(value) {
   const [id, name, slug, master] = String(value).split(":");
-  if (!id || !name || !slug || !master) throw new Error(`Invalid --level ${value}. Use id:name:slug:filename.webp.`);
+  if (!id || !name || !slug || !master) throw new Error(`Invalid --level ${value}. Use id:name:slug:filename.ext.`);
   return {id, name, slug, master};
 }
 
@@ -216,24 +254,60 @@ function titleFromSlug(slug) {
 
 export function levelsFromMasterNames(names) {
   return names.map((name, index) => {
-    const slug = slugify(path.parse(name).name) || `level-${index + 1}`;
+    const slug = slugify(masterStem(name)) || `level-${index + 1}`;
     return {id: slug, name: titleFromSlug(slug), slug, master: name};
   });
 }
 
-export async function inspectMasters(mastersDir, expectedNames) {
-  const sharp = (await import("sharp")).default;
-  const entries = (await readdir(mastersDir)).filter(name => name.toLowerCase().endsWith(".webp"));
+export async function inspectMasters(mastersDir, expectedNames, {matchByStem = false} = {}) {
+  const allEntries = (await readdir(mastersDir, {withFileTypes: true}))
+    .filter(entry => entry.isFile())
+    .map(entry => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+  const entries = allEntries.filter(isSupportedMasterFilename);
   const byLower = new Map(entries.map(name => [name.toLowerCase(), name]));
+  const allByLower = new Map(allEntries.map(name => [name.toLowerCase(), name]));
+  const allByStem = new Map();
+  for (const name of allEntries) {
+    const stem = masterStem(name).toLowerCase();
+    const matches = allByStem.get(stem) ?? [];
+    matches.push(name);
+    allByStem.set(stem, matches);
+  }
+  const byStem = new Map();
+  for (const name of entries) {
+    const stem = masterStem(name).toLowerCase();
+    const matches = byStem.get(stem) ?? [];
+    matches.push(name);
+    byStem.set(stem, matches);
+  }
+  for (const [stem, matches] of byStem) {
+    if (matches.length > 1) {
+      throw new Error(`Multiple master images match ${stem}: ${matches.join(", ")}. Keep only one file for each master name.`);
+    }
+  }
   const wanted = expectedNames?.length ? expectedNames : entries;
-  if (!wanted.length) throw new Error(`No .webp masters in ${mastersDir}.`);
+  if (!wanted.length) {
+    throw new Error(`No supported image masters in ${mastersDir}. Sharp can read ${supportedMasterSuffixes().join(", ")}.`);
+  }
   const inspected = [];
   for (const name of wanted) {
-    const filename = byLower.get(path.basename(name).toLowerCase());
-    if (!filename) throw new Error(`Missing master ${path.basename(name)} in ${mastersDir}.`);
-    const metadata = await sharp(path.join(mastersDir, filename)).metadata();
+    const basename = path.basename(name);
+    const exactFilename = byLower.get(basename.toLowerCase());
+    const filename = exactFilename ?? (matchByStem ? byStem.get(masterStem(basename).toLowerCase())?.[0] : undefined);
+    const unsupportedFilename = allByLower.get(basename.toLowerCase())
+      ?? (matchByStem ? allByStem.get(masterStem(basename).toLowerCase())?.[0] : undefined);
+    if (!filename && unsupportedFilename) {
+      throw new Error(`${unsupportedFilename}: its file extension is not supported by this Sharp build.`);
+    }
+    if (!filename && matchByStem) {
+      throw new Error(`Missing master named ${masterStem(basename)} with a supported image extension in ${mastersDir}.`);
+    }
+    if (!filename) throw new Error(`Missing master ${basename} in ${mastersDir}.`);
+    const metadata = await inspectMasterImage(path.join(mastersDir, filename));
     inspected.push({
       name: filename,
+      format: metadata.format,
       width: metadata.width,
       height: metadata.height,
       channels: metadata.channels,
@@ -245,7 +319,6 @@ export async function inspectMasters(mastersDir, expectedNames) {
     if (master.width !== first.width || master.height !== first.height) {
       throw new Error(`${master.name}: ${master.width}x${master.height} does not match ${first.name} ${first.width}x${first.height}.`);
     }
-    if (master.channels !== 4 || !master.hasAlpha) throw new Error(`${master.name}: master must be RGBA.`);
   }
   return inspected;
 }
@@ -335,9 +408,13 @@ export async function buildProposedConfig({flags, levels}) {
     const columns = Number(input.width) / Number(input.gridSize);
     const rows = Number(input.height) / Number(input.gridSize);
     const expected = input.levels?.length ? input.levels.map(level => level.master) : undefined;
-    const masters = await inspectMasters(path.resolve(flags.get("masters")), expected);
+    const masters = await inspectMasters(path.resolve(flags.get("masters")), expected, {
+      matchByStem: flags.has("scene")
+    });
     applyMasterMeasurements(input, masters, columns, rows);
-    if (!input.levels?.length) input.levels = levelsFromMasterNames(masters.map(master => master.name));
+    if (input.levels?.length) {
+      input.levels = input.levels.map((level, index) => ({...level, master: masters[index].name}));
+    } else input.levels = levelsFromMasterNames(masters.map(master => master.name));
   }
 
   return proposeConfig(input);

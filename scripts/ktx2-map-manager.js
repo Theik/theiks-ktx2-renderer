@@ -1,58 +1,32 @@
 import {
   ByteLruCache,
   canvasRectToSceneRect,
-  RequestGeneration,
+  orderedVisibleLevelIds,
+  performanceLoadConcurrency,
+  PriorityLoadQueue,
+  QueueCancelledError,
+  resolveDisplaySlot,
   resolveNativeLevelId,
   scenePointToCanvasPoint,
   selectLod,
+  selectTileDemand,
   selectVisibleTiles,
-  StaleRequestError,
-  orderedVisibleLevelIds
+  retryDelay,
+  validateAscendingTierDensities,
+  validateManifestTileEntry
 } from "./map-pyramid-utils.js";
 
 const MODULE_ID = "theiks-ktx2-renderer";
 const SETTING_LOD = "mapLod";
 const CACHE_BYTES = 384 * 1024 * 1024;
-const PAN_DEBOUNCE_MS = 250;
-const RELEASE_DELAY_MS = 60000;
-const LOAD_CONCURRENCY = 1;
-const ACTIVE_HD_QUEUE_PRIORITY = 2;
-const RELATED_HD_QUEUE_PRIORITY = 1;
-const FALLBACK_QUEUE_PRIORITY = 0;
-
-class LoadQueue {
-  constructor(concurrency) {
-    this.concurrency = concurrency;
-    this.active = 0;
-    this.pending = [];
-  }
-
-  add(task, priority = 0) {
-    return new Promise((resolve, reject) => {
-      this.pending.push({task, resolve, reject, priority});
-      this.pending.sort((left, right) => right.priority - left.priority);
-      this.#drain();
-    });
-  }
-
-  clear(error = new StaleRequestError()) {
-    for (const item of this.pending.splice(0)) item.reject(error);
-  }
-
-  #drain() {
-    while (this.active < this.concurrency && this.pending.length) {
-      const item = this.pending.shift();
-      this.active += 1;
-      Promise.resolve()
-        .then(item.task)
-        .then(item.resolve, item.reject)
-        .finally(() => {
-          this.active -= 1;
-          this.#drain();
-        });
-    }
-  }
-}
+const RELEASE_DELAY_MS = 60_000;
+const PRIORITY = Object.freeze({
+  FALLBACK: 0,
+  ACTIVE_VISIBLE: 1,
+  RELATED_VISIBLE: 2,
+  ACTIVE_PREFETCH: 3,
+  RELATED_PREFETCH: 4
+});
 
 class Ktx2LevelContainer extends foundry.canvas.primary.PrimaryCanvasContainer {
   constructor(level) {
@@ -73,34 +47,34 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
   manifestUrl = null;
   containers = new Map();
   records = new Map();
+  slots = new Map();
   pendingLoads = new Map();
+  failures = new Map();
   unloadingPaths = new Map();
   nativeStates = new Map();
-  displayedTiers = new Map();
+  demand = new Map();
   activeTier = null;
   activeLevelId = null;
   visibleLevelIds = new Set();
   warningShown = false;
   viewScale = 1;
-  refreshTimer = null;
+  frameHandle = null;
   releaseTimer = null;
-  refreshing = false;
-  refreshQueued = false;
+  retryTimer = null;
+  retryAt = 0;
+  fatalState = false;
   destroyed = false;
 
   constructor(scene) {
     super(scene);
     this.cache = new ByteLruCache(CACHE_BYTES);
-    this.generations = new RequestGeneration();
-    this.queue = new LoadQueue(LOAD_CONCURRENCY);
+    this.queue = new PriorityLoadQueue(this.#loadConcurrency());
   }
 
   async _onInit() {
     try {
       const flag = this.scene.getFlag(MODULE_ID, "mapPyramid");
-      if (!flag || typeof flag !== "object") {
-        throw new Error("the mapPyramid flag is missing.");
-      }
+      if (!flag || typeof flag !== "object") throw new Error("the mapPyramid flag is missing.");
       if (!flag.manifest) throw new Error("the mapPyramid flag has no manifest path.");
       this.manifestUrl = flag.manifest;
       this.manifest = await this.#loadManifest(flag.manifest);
@@ -121,18 +95,14 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
       this.containers.set(level.id, container);
     }
     canvas.primary.sortChildren();
+    await this.#preloadInitialView();
   }
 
   async _onReady() {
     const fromStage = Number(canvas.stage?.scale?.x);
     if (Number.isFinite(fromStage) && fromStage > 0) this.viewScale = fromStage;
     this.#captureNativeLevelMeshes();
-    this.refreshing = true;
-    try {
-      await this.#refresh();
-    } finally {
-      this.refreshing = false;
-    }
+    this.#reconcile();
   }
 
   _registerHooks() {
@@ -152,16 +122,18 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
 
   async _onTearDown() {
     this.destroyed = true;
-    this.generations.next();
-    this.refreshQueued = false;
-    clearTimeout(this.refreshTimer);
+    this.#cancelFrame();
     clearTimeout(this.releaseTimer);
-    this.queue.clear();
+    clearTimeout(this.retryTimer);
+    this.queue.cancelWhere(() => true);
     this.#restoreAllNativeMeshes();
+    for (const slot of this.slots.values()) this.#destroySlot(slot);
+    this.slots.clear();
+    await Promise.allSettled([...this.pendingLoads.values()].map(entry => entry.promise));
     for (const record of this.records.values()) this.#destroyRecord(record);
     this.records.clear();
     this.cache.clear();
-    this.displayedTiers.clear();
+    this.demand.clear();
     this.visibleLevelIds.clear();
     for (const container of this.containers.values()) container.destroy({children: true});
     this.containers.clear();
@@ -169,34 +141,21 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
   }
 
   requestRefresh() {
-    if (this.destroyed) return;
-    if (this.refreshing) {
-      this.generations.next();
-      this.queue.clear();
-    }
-    clearTimeout(this.refreshTimer);
-    this.refreshTimer = setTimeout(() => this.#beginRefresh(), PAN_DEBOUNCE_MS);
-  }
-
-  #beginRefresh() {
-    if (this.destroyed) return;
-    if (this.refreshing) {
-      this.refreshQueued = true;
-      return;
-    }
-    this.refreshQueued = false;
-    this.refreshing = true;
-    this.#refresh()
-      .catch(error => {
-        if (!(error instanceof StaleRequestError)) this.#warnAndRestore(error);
-      })
-      .finally(() => {
-        this.refreshing = false;
-        if (this.refreshQueued && !this.destroyed) this.#beginRefresh();
-      });
+    if (this.destroyed || this.frameHandle != null) return;
+    const schedule = globalThis.requestAnimationFrame ?? (callback => setTimeout(callback, 0));
+    this.frameHandle = schedule(() => {
+      this.frameHandle = null;
+      try {
+        this.#reconcile();
+      } catch (error) {
+        this.#fatal(error);
+      }
+    });
   }
 
   getStats() {
+    const failedTiles = [...this.failures.keys()].filter(key => this.demand.has(key)).length;
+    const prefetchedTiles = [...this.demand.values()].filter(entry => entry.prefetch).length;
     return {
       sceneId: this.scene.id,
       activeLevelId: this.activeLevelId,
@@ -204,7 +163,17 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
       loadedTextures: this.records.size,
       pendingTextures: this.pendingLoads.size,
       estimatedCacheBytes: this.cache.totalBytes,
-      cacheBudgetBytes: this.cache.maximumBytes
+      cacheBudgetBytes: this.cache.maximumBytes,
+      queuedTiles: this.queue.queuedCount,
+      inFlightTiles: this.queue.inFlightCount,
+      failedTiles,
+      visibleSlots: this.slots.size,
+      prefetchedTiles,
+      queuedTextures: this.queue.queuedCount,
+      inFlightTextures: this.queue.inFlightCount,
+      failedTextures: failedTiles,
+      visibleSlotCount: this.slots.size,
+      prefetchedTextures: prefetchedTiles
     };
   }
 
@@ -228,43 +197,406 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
   #validateManifest() {
     const manifest = this.manifest;
     if (!manifest || typeof manifest !== "object") throw new Error("the pyramid manifest is not an object.");
-    if (!Array.isArray(manifest.levels) || !manifest.levels.length) {
-      throw new Error("the pyramid manifest has no levels.");
-    }
+    if (manifest.schemaVersion !== 1) throw new Error(`unsupported pyramid schema ${manifest.schemaVersion}.`);
+    if (!Array.isArray(manifest.levels) || !manifest.levels.length) throw new Error("the pyramid manifest has no levels.");
     if (!manifest.scene || typeof manifest.scene !== "object") throw new Error("the pyramid manifest has no scene size.");
     if (manifest.scene.width !== this.scene.width || manifest.scene.height !== this.scene.height) {
       throw new Error("Map pyramid dimensions do not match the Scene.");
     }
     if (manifest.scene.gridSize !== this.scene.grid.size) throw new Error("Map pyramid grid size does not match the Scene.");
+
+    let referenceTiers;
     for (const level of manifest.levels) {
       if (!level?.id || !Array.isArray(level.tiers) || !level.tiers.length) {
         throw new Error(`level ${level?.id ?? "(missing id)"} has no tile tiers.`);
       }
+      const tierShape = [];
       for (const tier of level.tiers) {
         if (!tier?.id || !Array.isArray(tier.tiles) || !tier.tiles.length) {
           throw new Error(`${level.name ?? level.id} ${tier?.id ?? "tier"} has no tiles.`);
         }
-        for (const tile of tier.tiles) {
-          if (!tile?.id || !tile.path || !tile.scene || !tile.pixel || !tile.frame) {
-            throw new Error(`${level.name ?? level.id} ${tier.id} has a tile the renderer cannot read.`);
-          }
-        }
+        const density = Number(tier.density ?? (tier.gridPixels / manifest.scene.gridSize));
+        tier.density = density;
+        tierShape.push(`${tier.id}:${density}`);
+        for (const tile of tier.tiles) validateManifestTileEntry(tile);
+      }
+      validateAscendingTierDensities(level.tiers, manifest.scene.gridSize);
+      if (!referenceTiers) referenceTiers = tierShape;
+      else if (referenceTiers.join("|") !== tierShape.join("|")) {
+        throw new Error(`${level.name ?? level.id} does not use the same tier ladder as the other floors.`);
+      }
+      if (level.tiers[0].tiles.some(tile => tile.blank)) {
+        throw new Error(`${level.name ?? level.id} has a blank least-density fallback tile.`);
       }
     }
   }
 
-  #sceneLabel() {
-    return this.scene?.name || this.scene?.id || "this Scene";
+  async #preloadInitialView() {
+    const levelIds = this.#visibleLevels();
+    if (!levelIds.length) return;
+    const rootLoads = [];
+    for (const levelId of levelIds) {
+      const level = this.#level(levelId);
+      const tier = level?.tiers[0];
+      if (!tier) continue;
+      for (const tile of tier.tiles) rootLoads.push(this.#requestTile(level, tier, tile, PRIORITY.FALLBACK, true));
+    }
+    await Promise.all(rootLoads);
+
+    const activeId = canvas.level?.id;
+    const activeLevel = this.#level(activeId);
+    const viewport = this.#safeViewport();
+    if (!activeLevel || !viewport) return;
+    const tierId = selectLod(this.#effectiveScale(), null, this.#lodSetting(), activeLevel.tiers);
+    const tier = this.#tier(activeLevel, tierId);
+    if (tier === activeLevel.tiers[0]) return;
+    const margin = 0.5 * this.#largestTileDimension(tier);
+    const detail = selectVisibleTiles(tier.tiles, viewport, margin).filter(tile => !tile.blank);
+    await Promise.allSettled(detail.map(tile => this.#requestTile(activeLevel, tier, tile, PRIORITY.ACTIVE_VISIBLE, false)));
   }
 
-  #incompatibleMessage(error) {
-    const detail = error?.message ? ` ${error.message.replace(/^[A-Z]/, match => match.toLowerCase())}` : "";
-    return `${this.#sceneLabel()} needs a newer Theik's KTX2 Renderer (or the map module is newer than this renderer).${detail}`;
+  #reconcile() {
+    if (this.destroyed || this.fatalState || !canvas.ready || canvas.scene?.id !== this.scene.id) return;
+    const activeId = canvas.level?.id;
+    const activeLevel = this.#level(activeId);
+    if (!activeLevel) return;
+    const viewport = this.#viewport();
+    const visibleIds = this.#visibleLevels();
+    const visibleSet = new Set(visibleIds);
+    const requestedTier = selectLod(
+      this.#effectiveScale(),
+      this.activeLevelId === activeId ? this.activeTier : null,
+      this.#lodSetting(),
+      activeLevel.tiers
+    );
+    this.queue.setConcurrency(this.#loadConcurrency());
+
+    const nextDemand = new Map();
+    const display = new Map();
+    for (const levelId of visibleIds) {
+      const level = this.#level(levelId);
+      if (!level) continue;
+      const root = level.tiers[0];
+      for (const tile of root.tiles) this.#addDemand(nextDemand, level, root, tile, PRIORITY.FALLBACK, false, true);
+
+      const tier = this.#tier(level, requestedTier);
+      const margin = 0.25 * this.#largestTileDimension(tier);
+      const selected = selectTileDemand(tier.tiles, viewport, margin);
+      display.set(levelId, {level, tier, visible: selected.visible});
+      if (tier !== root) {
+        const active = levelId === activeId;
+        for (const tile of selected.visible) {
+          this.#addDemand(nextDemand, level, tier, tile, active ? PRIORITY.ACTIVE_VISIBLE : PRIORITY.RELATED_VISIBLE, false, false);
+        }
+        for (const tile of selected.prefetched) {
+          this.#addDemand(nextDemand, level, tier, tile, active ? PRIORITY.ACTIVE_PREFETCH : PRIORITY.RELATED_PREFETCH, true, false);
+        }
+      }
+    }
+
+    this.demand = nextDemand;
+    this.activeLevelId = activeId;
+    this.activeTier = requestedTier;
+    this.visibleLevelIds = visibleSet;
+    this.queue.cancelWhere(entry => !nextDemand.has(entry.key));
+
+    for (const [levelId, container] of this.containers) {
+      container.visible = visibleSet.has(levelId);
+      if (!container.visible) this.#restoreNativeMesh(levelId);
+    }
+    for (const {level, tier, visible} of display.values()) this.#syncLevelSlots(level, tier, visible);
+    for (const [key, slot] of this.slots) {
+      const state = display.get(slot.levelId);
+      if (!visibleSet.has(slot.levelId) || state?.tier.id !== slot.tierId || !state.visible.some(tile => tile.id === slot.tileId)) {
+        this.#destroySlot(slot);
+        this.slots.delete(key);
+      }
+    }
+    for (const {level, tier, visible} of display.values()) {
+      const covered = this.#visibleAreaCovered(level.id, tier, visible);
+      if (covered) this.#hideNativeMesh(level.id);
+      else this.#restoreNativeMesh(level.id);
+      const container = this.containers.get(level.id);
+      if (container) container.visible = covered || !this.nativeStates.has(level.id);
+    }
+
+    for (const entry of [...nextDemand.values()].sort((left, right) => left.priority - right.priority)) {
+      if (entry.tile.blank || this.records.has(entry.key)) continue;
+      const failure = this.failures.get(entry.key);
+      if (failure && failure.nextRetry > Date.now()) {
+        this.#scheduleRetry(failure.nextRetry);
+        continue;
+      }
+      void this.#requestTile(entry.level, entry.tier, entry.tile, entry.priority, entry.fallback)
+        .catch(error => {
+          if (error instanceof QueueCancelledError) return;
+          if (entry.fallback) this.#fatal(error);
+        });
+    }
+    this.#finishReconcile();
+    canvas.primary.renderDirty = true;
   }
 
-  #notifyIncompatible(error) {
-    console.error(`${MODULE_ID} | ${this.#sceneLabel()} KTX2 pyramid cannot be displayed.`, error);
-    if (game.user?.isGM) ui.notifications.error(this.#incompatibleMessage(error), {permanent: true});
+  #syncLevelSlots(level, tier, visibleTiles) {
+    for (const [key, slot] of this.slots) {
+      if (slot.levelId === level.id && slot.tierId !== tier.id) {
+        this.#destroySlot(slot);
+        this.slots.delete(key);
+      }
+    }
+    for (const tile of visibleTiles) {
+      const key = this.#slotKey(level.id, tier.id, tile.id);
+      if (tile.blank) {
+        const existing = this.slots.get(key);
+        if (existing) this.#destroySlot(existing);
+        this.slots.delete(key);
+        continue;
+      }
+      const selection = resolveDisplaySlot(level.id, level.tiers, tier.id, tile, new Set(this.records.keys()));
+      if (selection.mode === "uncovered") continue;
+      const target = selection.mode === "target";
+      const pieces = selection.pieces.map(piece => ({...piece, record: piece.key ? this.records.get(piece.key) : null}));
+      const signature = pieces.map(piece => piece.record
+        ? `${piece.record.key}:${piece.frame.x},${piece.frame.y},${piece.frame.width},${piece.frame.height}`
+        : `blank:${piece.scene.x},${piece.scene.y},${piece.scene.width},${piece.scene.height}`).join("|");
+      const existing = this.slots.get(key);
+      if (existing?.signature === signature) continue;
+      if (existing) this.#destroySlot(existing);
+      this.slots.set(key, this.#createSlot(level.id, tier.id, tile.id, pieces, signature, target));
+    }
+  }
+
+  #createSlot(levelId, tierId, tileId, pieces, signature, target) {
+    const slot = {levelId, tierId, tileId, signature, target, covered: true, meshes: [], sourceKeys: new Set()};
+    for (const piece of pieces) {
+      if (!piece.record) continue;
+      slot.sourceKeys.add(piece.record.key);
+      const framed = this.#frameTexture(piece.record.texture, piece.frame);
+      const mesh = new foundry.canvas.primary.PrimarySpriteMesh({
+        name: `ktx2.${levelId}.${tierId}.${tileId}`,
+        texture: framed
+      });
+      mesh.anchor.set(0, 0);
+      const position = scenePointToCanvasPoint(piece.scene, canvas.dimensions.sceneRect);
+      mesh.position.set(position.x, position.y);
+      mesh.width = piece.scene.width;
+      mesh.height = piece.scene.height;
+      mesh.eventMode = "none";
+      this.#configureBackgroundMesh(mesh, levelId);
+      this.containers.get(levelId).addChild(mesh);
+      slot.meshes.push({mesh, framed, source: piece.record.texture});
+    }
+    return slot;
+  }
+
+  #destroySlot(slot) {
+    for (const piece of slot.meshes) {
+      if (piece.mesh.parent) piece.mesh.parent.removeChild(piece.mesh);
+      piece.mesh.destroy({children: true, texture: false, textureSource: false});
+      if (piece.framed !== piece.source) piece.framed.destroy(false);
+    }
+    slot.meshes.length = 0;
+    slot.sourceKeys.clear();
+  }
+
+  #visibleAreaCovered(levelId, tier, visibleTiles) {
+    return visibleTiles.every(tile => tile.blank || this.slots.get(this.#slotKey(levelId, tier.id, tile.id))?.covered);
+  }
+
+  #addDemand(target, level, tier, tile, priority, prefetch, fallback) {
+    if (tile.blank) return;
+    const key = this.#tileKey(level.id, tier.id, tile.id);
+    const existing = target.get(key);
+    if (existing && existing.priority <= priority) return;
+    target.set(key, {key, level, tier, tile, priority, prefetch, fallback});
+  }
+
+  #requestTile(level, tier, tile, priority, fatal) {
+    if (tile.blank) return Promise.resolve(null);
+    const key = this.#tileKey(level.id, tier.id, tile.id);
+    const cached = this.cache.get(key);
+    if (cached) {
+      cached.lastUsed = Date.now();
+      return Promise.resolve(cached);
+    }
+    const pending = this.pendingLoads.get(key);
+    if (pending) {
+      this.queue.setPriority(key, priority);
+      return pending.promise;
+    }
+    const failure = this.failures.get(key);
+    if (failure && failure.nextRetry > Date.now()) {
+      this.#scheduleRetry(failure.nextRetry);
+      return Promise.reject(failure.error);
+    }
+
+    const entry = {promise: null};
+    const queued = this.queue.enqueue(key, priority, async () => {
+      await this.#waitForAssetUnload(tile.path);
+      const texture = await foundry.canvas.loadTexture(tile.path);
+      if (!texture) throw new Error(`Foundry returned no texture for ${tile.path}.`);
+      if (this.destroyed) {
+        texture.destroy(false);
+        throw new QueueCancelledError(`Discarded ${tile.path} after Scene teardown.`);
+      }
+      const record = {
+        key,
+        levelId: level.id,
+        tierId: tier.id,
+        tileId: tile.id,
+        path: tile.path,
+        texture,
+        bytes: tile.pixel.width * tile.pixel.height * 4,
+        lastUsed: Date.now()
+      };
+      this.records.set(key, record);
+      this.failures.delete(key);
+      const evicted = this.cache.set(key, record, record.bytes, this.#pinnedKeys());
+      for (const [evictedKey, evictedRecord] of evicted) this.#destroyRecord(evictedRecord, evictedKey);
+      this.requestRefresh();
+      return record;
+    });
+    if (!queued) return Promise.resolve(this.records.get(key) ?? null);
+    entry.promise = queued.catch(error => {
+      if (error instanceof QueueCancelledError || this.destroyed) throw error;
+      this.#recordFailure(key, tile.path, error, fatal);
+      throw error;
+    }).finally(() => {
+      if (this.pendingLoads.get(key) === entry) this.pendingLoads.delete(key);
+    });
+    this.pendingLoads.set(key, entry);
+    return entry.promise;
+  }
+
+  #recordFailure(key, path, error, fatal) {
+    console.error(`${MODULE_ID} | Could not load map tile ${path}.`, error);
+    if (fatal) return;
+    const previous = this.failures.get(key);
+    const attempts = (previous?.attempts ?? 0) + 1;
+    const delay = retryDelay(attempts);
+    const nextRetry = Date.now() + delay;
+    this.failures.set(key, {attempts, nextRetry, error});
+    if (this.demand.has(key)) this.#scheduleRetry(nextRetry);
+    if (!this.warningShown && game.user?.isGM) {
+      ui.notifications.warn(`Some detailed map tiles failed to load on ${this.#sceneLabel()}. Lower-detail coverage will remain visible while the renderer retries.`);
+      this.warningShown = true;
+    }
+  }
+
+  #scheduleRetry(at) {
+    if (this.destroyed || (this.retryTimer && this.retryAt <= at)) return;
+    clearTimeout(this.retryTimer);
+    this.retryAt = at;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.retryAt = 0;
+      this.requestRefresh();
+    }, Math.max(0, at - Date.now()));
+  }
+
+  #finishReconcile() {
+    const pinned = this.#pinnedKeys();
+    const now = Date.now();
+    for (const key of pinned) {
+      const record = this.records.get(key);
+      if (record) record.lastUsed = now;
+    }
+    for (const [key, record] of this.cache.evict(pinned)) this.#destroyRecord(record, key);
+    clearTimeout(this.releaseTimer);
+    this.releaseTimer = setTimeout(() => this.#releaseOffscreen(), RELEASE_DELAY_MS);
+  }
+
+  #releaseOffscreen() {
+    if (this.destroyed) return;
+    const pinned = this.#pinnedKeys();
+    const cutoff = Date.now() - RELEASE_DELAY_MS;
+    for (const [key, record] of this.records) {
+      if (pinned.has(key) || record.lastUsed > cutoff) continue;
+      this.cache.delete(key);
+      this.#destroyRecord(record, key);
+    }
+    canvas.primary.renderDirty = true;
+  }
+
+  #pinnedKeys() {
+    const pinned = new Set(this.demand.keys());
+    for (const slot of this.slots.values()) {
+      for (const key of slot.sourceKeys) pinned.add(key);
+    }
+    return pinned;
+  }
+
+  #loadConcurrency() {
+    try {
+      return performanceLoadConcurrency(game.settings.get("core", "performanceMode"));
+    } catch {
+      return 2;
+    }
+  }
+
+  #visibleLevels() {
+    const active = canvas.level;
+    if (!active) return [];
+    return orderedVisibleLevelIds(this.scene.levels, active.id);
+  }
+
+  #level(levelId) {
+    return this.manifest.levels.find(level => level.id === levelId);
+  }
+
+  #tier(level, tierId) {
+    const tier = level?.tiers.find(candidate => candidate.id === tierId);
+    if (!tier) throw new Error(`${level?.name ?? "Map level"} does not define ${tierId}.`);
+    return tier;
+  }
+
+  #largestTileDimension(tier) {
+    return Math.max(...tier.tiles.map(tile => Math.max(tile.scene.width, tile.scene.height)));
+  }
+
+  #lodSetting() {
+    try {
+      return game.settings.get(MODULE_ID, SETTING_LOD) || "auto";
+    } catch {
+      return "auto";
+    }
+  }
+
+  #effectiveScale() {
+    const fromStage = Number(canvas.stage?.scale?.x);
+    const scale = Number.isFinite(fromStage) && fromStage > 0 ? fromStage : this.viewScale;
+    const resolution = Number(canvas.app?.renderer?.resolution ?? 1) || 1;
+    return scale * resolution;
+  }
+
+  #safeViewport() {
+    try {
+      return this.#viewport();
+    } catch {
+      return null;
+    }
+  }
+
+  #viewport() {
+    const renderer = canvas.app.renderer;
+    const topLeft = canvas.canvasCoordinatesFromClient({x: 0, y: 0});
+    const bottomRight = canvas.canvasCoordinatesFromClient({x: renderer.screen.width, y: renderer.screen.height});
+    const x = Math.min(topLeft.x, bottomRight.x);
+    const y = Math.min(topLeft.y, bottomRight.y);
+    return canvasRectToSceneRect({
+      x,
+      y,
+      width: Math.abs(bottomRight.x - topLeft.x),
+      height: Math.abs(bottomRight.y - topLeft.y)
+    }, canvas.dimensions.sceneRect);
+  }
+
+  #tileKey(levelId, tierId, tileId) {
+    return `${levelId}/${tierId}/${tileId}`;
+  }
+
+  #slotKey(levelId, tierId, tileId) {
+    return `${levelId}/${tierId}/${tileId}`;
   }
 
   #captureNativeLevelMeshes() {
@@ -287,10 +619,7 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
 
   #hideNativeMesh(levelId) {
     const state = this.nativeStates.get(levelId);
-    if (!state) {
-      console.warn(`${MODULE_ID} | Could not identify the native background mesh for Level ${levelId}; leaving native rendering unchanged.`);
-      return false;
-    }
+    if (!state) return false;
     const mesh = state.mesh;
     if (mesh.parent) {
       state.parent = mesh.parent;
@@ -317,330 +646,15 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
     if (state.parent && mesh.parent !== state.parent) state.parent.addChild(mesh);
   }
 
+  #restoreAllNativeMeshes() {
+    for (const levelId of this.nativeStates.keys()) this.#restoreNativeMesh(levelId);
+  }
+
   #pointPrimaryBackgroundAtViewedLevel() {
     const viewedId = canvas.level?.id;
     const mesh = viewedId ? this.nativeStates.get(viewedId)?.mesh : null;
     if (!mesh || !canvas.primary) return;
     Object.defineProperty(canvas.primary, "background", {value: mesh, configurable: true});
-  }
-
-  #restoreAllNativeMeshes() {
-    for (const levelId of this.nativeStates.keys()) this.#restoreNativeMesh(levelId);
-  }
-
-  #visibleLevelIds() {
-    const active = canvas.level;
-    if (!active) return [];
-    return orderedVisibleLevelIds(this.scene.levels, active.id);
-  }
-
-  #lodSetting() {
-    try {
-      return game.settings.get(MODULE_ID, SETTING_LOD) || "auto";
-    } catch {
-      return "auto";
-    }
-  }
-
-  #effectiveScale() {
-    const fromStage = Number(canvas.stage?.scale?.x);
-    const scale = Number.isFinite(fromStage) && fromStage > 0 ? fromStage : this.viewScale;
-    const resolution = Number(canvas.app?.renderer?.resolution ?? 1) || 1;
-    return scale * resolution;
-  }
-
-  #viewport() {
-    const renderer = canvas.app.renderer;
-    const topLeft = canvas.canvasCoordinatesFromClient({x: 0, y: 0});
-    const bottomRight = canvas.canvasCoordinatesFromClient({x: renderer.screen.width, y: renderer.screen.height});
-    const x = Math.min(topLeft.x, bottomRight.x);
-    const y = Math.min(topLeft.y, bottomRight.y);
-    return canvasRectToSceneRect({
-      x,
-      y,
-      width: Math.abs(bottomRight.x - topLeft.x),
-      height: Math.abs(bottomRight.y - topLeft.y)
-    }, canvas.dimensions.sceneRect);
-  }
-
-  #tier(level, tierId) {
-    const tier = level.tiers.find(candidate => candidate.id === tierId);
-    if (!tier) throw new Error(`${level.name} does not define ${tierId}.`);
-    return tier;
-  }
-
-  #tileKey(levelId, tierId, tileId) {
-    return `${levelId}/${tierId}/${tileId}`;
-  }
-
-  #setLevelDisplay(levelId, tierId, {includeLow = false} = {}) {
-    for (const record of this.records.values()) {
-      if (record.levelId === levelId) record.mesh.visible = record.tierId === tierId || (includeLow && record.tierId === "z0");
-    }
-  }
-
-  #hasTiles(levelId, tierId, tiles) {
-    return tiles.every(tile => this.records.has(this.#tileKey(levelId, tierId, tile.id)));
-  }
-
-  #isCurrentViewReady(activeId, requestedTier, pinned, visibleLevelIds) {
-    if (this.activeLevelId !== activeId || this.activeTier !== requestedTier) return false;
-    if (this.visibleLevelIds.size !== visibleLevelIds.size) return false;
-    for (const levelId of visibleLevelIds) {
-      if (!this.visibleLevelIds.has(levelId)) return false;
-    }
-    if ((this.displayedTiers.get(activeId) ?? "z0") !== requestedTier) return false;
-    const activePrefix = `${activeId}/`;
-    for (const key of pinned) {
-      if (key.startsWith(activePrefix) && !this.records.has(key)) return false;
-    }
-    return true;
-  }
-
-  async #refresh() {
-    if (this.destroyed || !canvas.ready || canvas.scene?.id !== this.scene.id) return;
-    const active = canvas.level;
-    if (!active) return;
-    const visibleLevelIds = this.#visibleLevelIds();
-    const visibleSet = new Set(visibleLevelIds);
-    const viewport = this.#viewport();
-    const requestedTier = selectLod(
-      this.#effectiveScale(),
-      this.activeLevelId === active.id ? this.activeTier : null,
-      this.#lodSetting()
-    );
-    const pinned = new Set();
-    const relatedLevelIds = visibleLevelIds.filter(levelId => levelId !== active.id);
-
-    this.#pinLevelFallback(active.id, pinned);
-    if (requestedTier !== "z0") this.#pinVisibleTiles(active.id, requestedTier, viewport, pinned);
-    for (const levelId of relatedLevelIds) {
-      this.#pinLevelFallback(levelId, pinned);
-      if (requestedTier !== "z0") this.#pinVisibleTiles(levelId, requestedTier, viewport, pinned);
-    }
-    if (this.#isCurrentViewReady(active.id, requestedTier, pinned, visibleSet)) return;
-
-    const generation = this.generations.next();
-
-    for (const [levelId, container] of this.containers) {
-      if (levelId === active.id) {
-        container.visible = true;
-        this.#hideNativeMesh(levelId);
-        continue;
-      }
-      if (!visibleSet.has(levelId)) {
-        container.visible = false;
-        this.#restoreNativeMesh(levelId);
-        continue;
-      }
-      const nearerIds = relatedLevelIds.slice(0, relatedLevelIds.indexOf(levelId));
-      const nearerShowing = nearerIds.every(id => this.containers.get(id)?.visible);
-      if (!nearerShowing) container.visible = false;
-      this.#hideNativeMesh(levelId);
-    }
-    this.visibleLevelIds = visibleSet;
-    const activeLevel = this.manifest.levels.find(level => level.id === active.id);
-    if (!activeLevel) return;
-    await this.#ensureLevelFallback(active.id, pinned, generation);
-    if (!this.generations.isCurrent(generation)) return;
-    this.#hideNativeMesh(active.id);
-
-    if (requestedTier === "z0") {
-      this.#showLevelTier(active.id, "z0");
-      this.activeLevelId = active.id;
-      this.activeTier = "z0";
-      this.#finishRefresh(pinned);
-      this.#loadRelatedLevels(relatedLevelIds, "z0", viewport, pinned, generation);
-      return;
-    }
-
-    const visibleTiles = this.#pinVisibleTiles(active.id, requestedTier, viewport, pinned);
-    if (!visibleTiles.length) {
-      this.#showLevelTier(active.id, this.displayedTiers.get(active.id) ?? "z0");
-      this.activeLevelId = active.id;
-      this.#finishRefresh(pinned);
-      this.#loadRelatedLevels(relatedLevelIds, requestedTier, viewport, pinned, generation);
-      return;
-    }
-    this.#keepLevelUntilReady(active.id, requestedTier, visibleTiles);
-    const highDetail = Promise.all(visibleTiles.map(tile => this.#ensureTile(
-      activeLevel,
-      this.#tier(activeLevel, requestedTier),
-      tile,
-      pinned,
-      generation,
-      ACTIVE_HD_QUEUE_PRIORITY
-    )));
-    this.#loadRelatedLevels(relatedLevelIds, requestedTier, viewport, pinned, generation);
-    await highDetail;
-    if (!this.generations.isCurrent(generation)) return;
-    this.#showLevelTier(active.id, requestedTier);
-    this.activeLevelId = active.id;
-    this.activeTier = requestedTier;
-    this.#finishRefresh(pinned);
-  }
-
-  #showLevelTier(levelId, tierId, {includeLow = false} = {}) {
-    this.#setLevelDisplay(levelId, tierId, {includeLow});
-    if (!includeLow) this.displayedTiers.set(levelId, tierId);
-  }
-
-  #revealLevel(levelId, tierId, options) {
-    this.#showLevelTier(levelId, tierId, options);
-    const container = this.containers.get(levelId);
-    if (container) container.visible = true;
-    canvas.primary.renderDirty = true;
-  }
-
-  #keepLevelUntilReady(levelId, requestedTier, tiles) {
-    if (this.#hasTiles(levelId, requestedTier, tiles)) return;
-    const previousTier = this.displayedTiers.get(levelId) ?? "z0";
-    this.#showLevelTier(levelId, previousTier, {includeLow: previousTier !== "z0"});
-  }
-
-  #pinVisibleTiles(levelId, tierId, viewport, pinned) {
-    const level = this.manifest.levels.find(candidate => candidate.id === levelId);
-    if (!level) return [];
-    const tiles = selectVisibleTiles(this.#tier(level, tierId).tiles, viewport);
-    for (const tile of tiles) pinned.add(this.#tileKey(levelId, tierId, tile.id));
-    return tiles;
-  }
-
-  #loadRelatedLevels(levelIds, requestedTier, viewport, pinned, generation) {
-    void (async () => {
-      for (const levelId of levelIds) {
-        await this.#ensureLevelFallback(levelId, pinned, generation);
-        if (!this.generations.isCurrent(generation)) return;
-        this.#hideNativeMesh(levelId);
-        if (requestedTier === "z0") {
-          this.#revealLevel(levelId, "z0");
-          continue;
-        }
-        const level = this.manifest.levels.find(candidate => candidate.id === levelId);
-        if (!level) continue;
-        const tiles = this.#pinVisibleTiles(levelId, requestedTier, viewport, pinned);
-        if (!tiles.length) {
-          this.#revealLevel(levelId, this.displayedTiers.get(levelId) ?? "z0");
-          continue;
-        }
-        this.#keepLevelUntilReady(levelId, requestedTier, tiles);
-        const container = this.containers.get(levelId);
-        if (container) container.visible = true;
-        canvas.primary.renderDirty = true;
-        await Promise.all(tiles.map(tile => this.#ensureTile(
-          level,
-          this.#tier(level, requestedTier),
-          tile,
-          pinned,
-          generation,
-          RELATED_HD_QUEUE_PRIORITY
-        )));
-        if (!this.generations.isCurrent(generation)) return;
-        this.#showLevelTier(levelId, requestedTier);
-        canvas.primary.renderDirty = true;
-      }
-    })().catch(error => {
-      if (!(error instanceof StaleRequestError)) this.#warnAndRestore(error);
-    });
-  }
-
-  #pinLevelFallback(levelId, pinned) {
-    const level = this.manifest.levels.find(candidate => candidate.id === levelId);
-    if (!level) return null;
-    const lowTier = this.#tier(level, "z0");
-    const lowTile = lowTier.tiles[0];
-    pinned.add(this.#tileKey(levelId, "z0", lowTile.id));
-    return {level, lowTier, lowTile};
-  }
-
-  async #ensureLevelFallback(levelId, pinned, generation) {
-    const fallback = this.#pinLevelFallback(levelId, pinned);
-    if (!fallback) return;
-    await this.#ensureTile(fallback.level, fallback.lowTier, fallback.lowTile, pinned, generation);
-  }
-
-  #finishRefresh(pinned) {
-    for (const [key, record] of this.records) {
-      if (pinned.has(key)) record.lastUsed = Date.now();
-    }
-    for (const [key, record] of this.cache.evict(pinned)) this.#destroyRecord(record, key);
-    clearTimeout(this.releaseTimer);
-    this.releaseTimer = setTimeout(() => this.#releaseOffscreen(pinned), RELEASE_DELAY_MS);
-    canvas.primary.renderDirty = true;
-  }
-
-  #releaseOffscreen(pinned) {
-    if (this.destroyed) return;
-    const cutoff = Date.now() - RELEASE_DELAY_MS;
-    for (const [key, record] of this.records) {
-      if (pinned.has(key) || record.lastUsed > cutoff) continue;
-      this.cache.delete(key);
-      this.#destroyRecord(record, key);
-    }
-    canvas.primary.renderDirty = true;
-  }
-
-  async #ensureTile(level, tier, tile, pinned, generation, priority) {
-    const key = this.#tileKey(level.id, tier.id, tile.id);
-    const cached = this.cache.get(key);
-    if (cached) {
-      cached.lastUsed = Date.now();
-      return cached;
-    }
-    let pending = this.pendingLoads.get(key);
-    if (pending) {
-      pending.generation = generation;
-      return pending.promise;
-    }
-    pending = {generation, promise: null};
-    const queuePriority = priority ?? (tier.id === "z0" ? FALLBACK_QUEUE_PRIORITY : ACTIVE_HD_QUEUE_PRIORITY);
-    pending.promise = this.queue.add(async () => {
-        this.generations.assertCurrent(pending.generation);
-        await this.#waitForAssetUnload(tile.path);
-        this.generations.assertCurrent(pending.generation);
-        const texture = await foundry.canvas.loadTexture(tile.path);
-        if (!texture) throw new Error(`Foundry returned no texture for ${tile.path}.`);
-        if (this.destroyed) throw new Error(`Discarded texture ${tile.path} after Scene teardown.`);
-        if (!this.generations.isCurrent(pending.generation)) {
-          texture.destroy(false);
-          if (tier.id !== "z0") await this.#unloadAsset(tile.path);
-          throw new StaleRequestError();
-        }
-        const framed = this.#frameTexture(texture, tile.frame);
-        const mesh = new foundry.canvas.primary.PrimarySpriteMesh({
-          name: `ktx2.${level.id}.${tier.id}.${tile.id}`,
-          texture: framed
-        });
-        mesh.anchor.set(0, 0);
-        const position = scenePointToCanvasPoint(tile.scene, canvas.dimensions.sceneRect);
-        mesh.position.set(position.x, position.y);
-        mesh.width = tile.scene.width;
-        mesh.height = tile.scene.height;
-        mesh.visible = false;
-        mesh.eventMode = "none";
-        const record = {
-          key,
-          levelId: level.id,
-          tierId: tier.id,
-          tileId: tile.id,
-          path: tile.path,
-          texture,
-          framed,
-          mesh,
-          bytes: tile.pixel.width * tile.pixel.height * 4,
-          lastUsed: Date.now()
-        };
-        this.containers.get(level.id).addChild(mesh);
-        this.#configureBackgroundMesh(mesh, level.id);
-        this.records.set(key, record);
-        const evicted = this.cache.set(key, record, record.bytes, pinned);
-        for (const [evictedKey, evictedRecord] of evicted) this.#destroyRecord(evictedRecord, evictedKey);
-        return record;
-      }, queuePriority).finally(() => {
-        if (this.pendingLoads.get(key) === pending) this.pendingLoads.delete(key);
-      });
-    this.pendingLoads.set(key, pending);
-    return pending.promise;
   }
 
   #configureBackgroundMesh(mesh, levelId) {
@@ -663,11 +677,8 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
   #destroyRecord(record, key = record?.key) {
     if (!record) return;
     if (key) this.records.delete(key);
-    if (record.mesh?.parent) record.mesh.parent.removeChild(record.mesh);
-    record.mesh?.destroy({children: true, texture: false, textureSource: false});
-    if (record.framed && record.framed !== record.texture) record.framed.destroy(false);
     record.texture?.destroy(false);
-    if (record.tierId !== "z0") void this.#unloadAsset(record.path);
+    if (record.tierId !== this.#level(record.levelId)?.tiers[0]?.id) void this.#unloadAsset(record.path);
   }
 
   async #waitForAssetUnload(path) {
@@ -692,15 +703,36 @@ export class Ktx2MapManager extends foundry.canvas.SceneManager {
     return pending;
   }
 
-  #warnAndRestore(error) {
-    console.error(`${MODULE_ID} | High-resolution map streaming failed.`, error);
+  #cancelFrame() {
+    if (this.frameHandle == null) return;
+    const cancel = globalThis.cancelAnimationFrame ?? clearTimeout;
+    cancel(this.frameHandle);
+    this.frameHandle = null;
+  }
+
+  #sceneLabel() {
+    return this.scene?.name || this.scene?.id || "this Scene";
+  }
+
+  #incompatibleMessage(error) {
+    const detail = error?.message ? ` ${error.message.replace(/^[A-Z]/, match => match.toLowerCase())}` : "";
+    return `${this.#sceneLabel()} needs a newer Theik's KTX2 Renderer (or the map module is newer than this renderer).${detail}`;
+  }
+
+  #notifyIncompatible(error) {
+    console.error(`${MODULE_ID} | ${this.#sceneLabel()} KTX2 pyramid cannot be displayed.`, error);
+    if (game.user?.isGM) ui.notifications.error(this.#incompatibleMessage(error), {permanent: true});
+  }
+
+  #fatal(error) {
+    if (this.destroyed || this.fatalState) return;
+    this.fatalState = true;
+    console.error(`${MODULE_ID} | Required map fallback failed.`, error);
+    this.queue.cancelWhere(() => true);
     this.#restoreAllNativeMeshes();
     for (const container of this.containers.values()) container.visible = false;
     this.visibleLevelIds.clear();
-    if (!this.warningShown && game.user?.isGM) {
-      ui.notifications.warn(`High-resolution map streaming failed on ${this.#sceneLabel()}. Foundry restored the low-resolution backgrounds; check the console for details.`);
-      this.warningShown = true;
-    }
+    if (game.user?.isGM) ui.notifications.error(`Required map coverage failed on ${this.#sceneLabel()}. Foundry restored the native backgrounds.`, {permanent: true});
   }
 }
 
@@ -732,7 +764,7 @@ function warnIfPyramidDidNotAttach(scene) {
 Hooks.once("init", () => {
   game.settings.register(MODULE_ID, SETTING_LOD, {
     name: "Map detail",
-    hint: "Choose automatic zoom-based map detail or force one pyramid tier for this browser.",
+    hint: "Choose automatic zoom-based map detail or force a semantic detail level for this browser.",
     scope: "client",
     config: true,
     type: String,

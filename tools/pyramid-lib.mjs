@@ -6,12 +6,24 @@ import {spawn} from "node:child_process";
 export {
   ByteLruCache,
   canvasRectToSceneRect,
+  intersectRectangles,
+  mapSceneRectToTileFrame,
+  performanceLoadConcurrency,
+  PriorityLoadQueue,
+  QueueCancelledError,
   rectanglesIntersect,
   resolveNativeLevelId,
   RequestGeneration,
+  resolveDisplaySlot,
   scenePointToCanvasPoint,
   selectLod,
+  selectTileDemand,
   selectVisibleTiles,
+  semanticTier,
+  sortTiersByDensity,
+  validateAscendingTierDensities,
+  validateManifestTileEntry,
+  retryDelay,
   StaleRequestError,
   levelBottomElevation,
   orderedVisibleLevelIds,
@@ -202,6 +214,23 @@ export function premultiplyRgba(data) {
     data[offset + 2] = Math.round(data[offset + 2] * alpha);
   }
   return data;
+}
+
+export function contentFrameIsTransparent(data, imageWidth, imageHeight, frame) {
+  if (data.length !== imageWidth * imageHeight * 4) throw new Error("RGBA buffer dimensions do not match its data length.");
+  const left = Math.round(frame.x);
+  const top = Math.round(frame.y);
+  const right = left + Math.round(frame.width);
+  const bottom = top + Math.round(frame.height);
+  if (left < 0 || top < 0 || right > imageWidth || bottom > imageHeight) {
+    throw new Error("Content frame lies outside the RGBA buffer.");
+  }
+  for (let y = top; y < bottom; y += 1) {
+    for (let x = left; x < right; x += 1) {
+      if (data[((y * imageWidth) + x) * 4 + 3] !== 0) return false;
+    }
+  }
+  return true;
 }
 
 export async function sha256File(filename) {

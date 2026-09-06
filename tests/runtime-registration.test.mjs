@@ -9,7 +9,11 @@ test("flagged scenes register the KTX2 SceneManager even without a matching vers
 
   globalThis.foundry = {
     canvas: {
-      SceneManager: class {},
+      SceneManager: class {
+        constructor(scene) {
+          this.scene = scene;
+        }
+      },
       primary: {PrimaryCanvasContainer: class {}},
       groups: {PrimaryCanvasGroup: {SORT_LAYERS: {SCENE: 0}}}
     }
@@ -58,4 +62,25 @@ test("flagged scenes register the KTX2 SceneManager even without a matching vers
 
   once.get("ready")();
   assert.equal(typeof moduleRecord.api.getMapStreamingStats, "function");
+
+  const manager = new Ktx2MapManager({id: "stats-scene"});
+  assert.deepEqual(manager.getStats(), {
+    sceneId: "stats-scene",
+    activeLevelId: null,
+    activeTier: null,
+    loadedTextures: 0,
+    pendingTextures: 0,
+    estimatedCacheBytes: 0,
+    cacheBudgetBytes: 384 * 1024 * 1024,
+    queuedTiles: 0,
+    inFlightTiles: 0,
+    failedTiles: 0,
+    visibleSlots: 0,
+    prefetchedTiles: 0,
+    queuedTextures: 0,
+    inFlightTextures: 0,
+    failedTextures: 0,
+    visibleSlotCount: 0,
+    prefetchedTextures: 0
+  });
 });

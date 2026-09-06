@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {randomUUID} from "node:crypto";
 import {
   mkdir,
+  readdir,
   readFile,
   rename,
   rm,
@@ -16,6 +17,7 @@ import sharp from "sharp";
 
 import {
   createTileLayout,
+  contentFrameIsTransparent,
   exists,
   fileSize,
   markKtxPremultiplied,
@@ -27,8 +29,10 @@ import {
   resolveTierGutter,
   runProcess,
   sha256File,
-  sha256Json
+  sha256Json,
+  validateManifestTileEntry
 } from "./pyramid-lib.mjs";
+import {inspectMasterImage, normalizedMasterPipeline} from "./master-image.mjs";
 
 const RENDERER_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const GITHUB_FILE_LIMIT = 95 * 1024 * 1024;
@@ -38,7 +42,7 @@ const USAGE = `Usage: node tools/pyramid.mjs <doctor|rebuild|verify>
   --output <dir>
   --module-id <foundryModuleId>
   [--module-root <dir>]
-  [--levels all|slug,...] [--tiers all|z0,z1,z2]
+  [--levels all|slug,...] [--tiers all|z0,z1,...]
   [--runtime-only]`;
 
 export function parseCli(argv) {
@@ -169,12 +173,9 @@ async function inspectMaster(ctx, level) {
   const filename = masterPath(ctx, level);
   const relativeMaster = masterFilename(level);
   if (!(await exists(filename))) throw new Error(`${level.name}: missing local master ${relativeMaster}`);
-  const metadata = await sharp(filename).metadata();
+  const metadata = await inspectMasterImage(filename);
   assert.equal(metadata.width, ctx.config.scene.masterWidth, `${level.name}: incorrect master width.`);
   assert.equal(metadata.height, ctx.config.scene.masterHeight, `${level.name}: incorrect master height.`);
-  assert.equal(metadata.space, "srgb", `${level.name}: master must use sRGB.`);
-  assert.equal(metadata.channels, 4, `${level.name}: master must have RGBA channels.`);
-  assert.equal(metadata.hasAlpha, true, `${level.name}: master must have alpha.`);
   return {
     path: relativeMaster,
     width: metadata.width,
@@ -215,8 +216,8 @@ async function doctor(ctx) {
   }
 }
 
-async function createPremultipliedPng(masterFile, tile, outputPath) {
-  let pipeline = sharp(masterFile, {limitInputPixels: false})
+export async function createPremultipliedPng(masterFile, tile, outputPath) {
+  let pipeline = normalizedMasterPipeline(masterFile)
     .extract({
       left: tile.source.cropX,
       top: tile.source.cropY,
@@ -229,9 +230,13 @@ async function createPremultipliedPng(masterFile, tile, outputPath) {
     pipeline = pipeline.extend({...tile.extend, extendWith: "copy"});
   }
 
-  const {data, info} = await pipeline.ensureAlpha().raw().toBuffer({resolveWithObject: true});
+  const {data, info} = await pipeline.raw().toBuffer({resolveWithObject: true});
+  assert.equal(info.channels, 4, `${path.basename(masterFile)}: Sharp did not produce RGBA pixels.`);
+  const frame = tile.frame ?? {x: 0, y: 0, width: info.width, height: info.height};
+  const blank = contentFrameIsTransparent(data, info.width, info.height, frame);
   premultiplyRgba(data);
   await sharp(data, {raw: info}).png({compressionLevel: 6, adaptiveFiltering: true}).toFile(outputPath);
+  return {blank};
 }
 
 function commonEncoderArguments(inputPath, outputPath) {
@@ -282,6 +287,7 @@ async function buildLevel(ctx, level, ktxCli, stagingRoot, masterInfo, rebuildTi
   await mkdir(temporaryRoot, {recursive: true});
 
   try {
+    const leastDensity = Math.min(...ctx.config.tiers.map(candidate => candidate.gridPixels / ctx.config.scene.gridSize));
     for (const tier of ctx.config.tiers) {
       if (!rebuildTierIds.has(tier.id)) {
         const previousTier = previousLevel?.tiers?.find(candidate => candidate.id === tier.id);
@@ -298,7 +304,14 @@ async function buildLevel(ctx, level, ktxCli, stagingRoot, masterInfo, rebuildTi
         const outputName = `${tile.id}.ktx2`;
         const outputPath = path.join(tierRoot, outputName);
         process.stdout.write(`${level.name} ${tier.id}/${tile.id}: preparing... `);
-        await createPremultipliedPng(masterPath(ctx, level), tile, pngPath);
+        const prepared = await createPremultipliedPng(masterPath(ctx, level), tile, pngPath);
+        const density = tier.gridPixels / ctx.config.scene.gridSize;
+        if (prepared.blank && density !== leastDensity) {
+          await rm(pngPath, {force: true});
+          console.log("blank; skipped encoding");
+          tileEntries.push({...tile, blank: true});
+          continue;
+        }
         process.stdout.write("encoding... ");
         const encoded = await encodeTile(ctx, ktxCli, pngPath, outputPath);
         await rm(pngPath, {force: true});
@@ -365,11 +378,19 @@ async function generatedTierMatches(ctx, level, configuredTier) {
   if (!tier || tier.tiles?.length !== expectedTiles.length || tier.gutter !== gutter) return false;
   for (const expectedTile of expectedTiles) {
     const tile = tier.tiles.find(candidate => candidate.id === expectedTile.id);
-    if (!tile?.path?.startsWith(ctx.modulePrefix) || !tile.sha256) return false;
-    if (tile.encoding === "rgba8-zstd") return false;
-    if (tile.mipLevels !== ctx.config.encoder.mipLevels) return false;
+    try {
+      validateManifestTileEntry(tile);
+    } catch {
+      return false;
+    }
+    if (JSON.stringify(tile.scene) !== JSON.stringify(expectedTile.scene)) return false;
     if (tile.pixel?.width !== expectedTile.pixel.width || tile.pixel?.height !== expectedTile.pixel.height) return false;
     if (JSON.stringify(tile.frame) !== JSON.stringify(expectedTile.frame)) return false;
+    if (configuredTier.id === ctx.config.tiers[0].id && tile.blank) return false;
+    if (tile.blank === true) continue;
+    if (!tile.path.startsWith(ctx.modulePrefix) || !tile.sha256) return false;
+    if (tile.encoding === "rgba8-zstd") return false;
+    if (tile.mipLevels !== ctx.config.encoder.mipLevels) return false;
     const filename = assetFilename(ctx, tile.path);
     if (!filename || !(await exists(filename)) || await sha256File(filename) !== tile.sha256) return false;
   }
@@ -523,12 +544,21 @@ async function verify(ctx) {
       assert.ok(tier, `${configuredLevel.name} is missing ${configuredTier.id}.`);
       const expectedLayout = createTileLayout(ctx.config, configuredTier);
       assert.equal(tier.tiles.length, expectedLayout.length, `${configuredLevel.name} ${configuredTier.id} tile count differs.`);
+      const expectedFiles = [];
       for (const expectedTile of expectedLayout) {
         const tile = tier.tiles.find(entry => entry.id === expectedTile.id);
         assert.ok(tile, `${configuredLevel.name} ${configuredTier.id} is missing ${expectedTile.id}.`);
+        validateManifestTileEntry(tile);
         assert.deepEqual(tile.pixel, expectedTile.pixel, `${configuredLevel.name} ${configuredTier.id}/${tile.id} dimensions differ.`);
+        assert.deepEqual(tile.scene, expectedTile.scene, `${configuredLevel.name} ${configuredTier.id}/${tile.id} Scene rectangle differs.`);
+        assert.deepEqual(tile.frame, expectedTile.frame, `${configuredLevel.name} ${configuredTier.id}/${tile.id} content frame differs.`);
+        assert.ok(configuredTier.id !== ctx.config.tiers[0].id || !tile.blank, `${configuredLevel.name} least-density fallback cannot be blank.`);
+        if (tile.blank === true) continue;
         const filename = assetFilename(ctx, tile.path);
         assert.ok(filename, `${tile.path}: is not inside module ${ctx.moduleId}.`);
+        const expectedAssetDirectory = posixJoin(ctx.modulePath, configuredLevel.slug, configuredTier.id);
+        assert.equal(path.posix.dirname(tile.path), expectedAssetDirectory, `${tile.path}: is not in its manifest tier directory.`);
+        expectedFiles.push(path.basename(filename));
         const data = await readFile(filename);
         const header = readKtx2Header(data);
         assert.equal(header.width, tile.pixel.width, `${tile.path}: KTX width differs.`);
@@ -543,6 +573,12 @@ async function verify(ctx) {
         textureCount += 1;
         totalBytes += data.length;
       }
+      const tierDirectory = path.join(ctx.outputRoot, configuredLevel.slug, configuredTier.id);
+      const actualFiles = (await readdir(tierDirectory, {withFileTypes: true}))
+        .filter(entry => entry.isFile())
+        .map(entry => entry.name)
+        .sort();
+      assert.deepEqual(actualFiles, expectedFiles.sort(), `${configuredLevel.name} ${configuredTier.id} contains unmanifested files.`);
     }
   }
 
