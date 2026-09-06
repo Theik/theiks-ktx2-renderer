@@ -95,6 +95,7 @@ Open your map module's `module.json`. If it has no `relationships` section, add 
     {
       "id": "theiks-ktx2-renderer",
       "type": "module",
+      "manifest": "https://github.com/Theik/theiks-ktx2-renderer/releases/latest/download/module.json",
       "compatibility": {
         "minimum": "1.0.0"
       }
