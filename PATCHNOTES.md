@@ -1,5 +1,9 @@
 # Patch notes
 
+## 1.0.4
+
+- Fixed incorrect release version metadata that prevented versions 1.0.2 and 1.0.3 from publishing.
+
 ## 1.0.3
 
 - Map tiles now preload around the camera and appear one at a time. Foundry's performance mode sets the load limit to one, two, or four concurrent requests.
