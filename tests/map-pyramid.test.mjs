@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import {access, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import os from "node:os";
 import test from "node:test";
 import path from "node:path";
 
@@ -32,7 +34,7 @@ import {
   orderedVisibleLevelIds,
   visibleSceneLevelIds
 } from "../tools/pyramid-lib.mjs";
-import {parseCli} from "../tools/pyramid.mjs";
+import {parseCli, replaceDirectory} from "../tools/pyramid.mjs";
 
 const config = {
   scene: {
@@ -319,4 +321,19 @@ test("CLI options and master filenames stay independent of the content module pa
     "modules/theiks-harrowstone/assets/maps/harrowstone-pyramid"
   );
   assert.equal(path.basename("assets/masters/ground-floor.webp"), "ground-floor.webp");
+});
+
+test("directory replacement creates a missing Level parent", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ktx2-directory-replacement-"));
+  t.after(() => rm(root, {force: true, recursive: true}));
+
+  const source = path.join(root, "staging", "summershade", "z0");
+  const destination = path.join(root, "output", "summershade", "z0");
+  await mkdir(source, {recursive: true});
+  await writeFile(path.join(source, "0-0.ktx2"), "tile");
+
+  await replaceDirectory(source, destination);
+
+  assert.equal(await readFile(path.join(destination, "0-0.ktx2"), "utf8"), "tile");
+  await assert.rejects(access(source), error => error.code === "ENOENT");
 });

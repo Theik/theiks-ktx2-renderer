@@ -204,6 +204,8 @@ The first build must include every floor and quality level:
 node tools/pyramid.mjs rebuild --config "../MODULE_FOLDER/tools/maps/MAP_NAME-pyramid.json" --masters "../MODULE_FOLDER/assets/masters" --output "../MODULE_FOLDER/assets/maps/MAP_NAME-pyramid" --module-id "MODULE_ID" --module-root "../MODULE_FOLDER" --levels all --tiers all
 ```
 
+The builder creates the output and Level folders when they do not exist.
+
 The build writes these files:
 
 ```text
@@ -223,7 +225,7 @@ For every entry in the Scene's `levels` list, replace only `background.src`. Use
 
 ```json
 "background": {
-  "src": "modules/MODULE_ID/assets/maps/MAP_NAME-pyramid/ground-floor/z0/0-0.ktx2"
+  "src": "modules/MODULE_ID/assets/maps/MAP_NAME-pyramid/LEVEL_NAME/z0/0-0.ktx2"
 }
 ```
 

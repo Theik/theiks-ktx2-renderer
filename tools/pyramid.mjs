@@ -409,8 +409,9 @@ async function generatedThumbnailMatches(ctx, thumbnail) {
   return Boolean(filename) && await exists(filename) && await sha256File(filename) === thumbnail.sha256;
 }
 
-async function replaceDirectory(source, destination) {
+export async function replaceDirectory(source, destination) {
   const backup = `${destination}.old-${randomUUID()}`;
+  await mkdir(path.dirname(destination), {recursive: true});
   if (await exists(destination)) await rename(destination, backup);
   try {
     await rename(source, destination);

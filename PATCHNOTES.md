@@ -1,5 +1,9 @@
 # Patch notes
 
+## 1.0.5
+
+- Fixed first-time pyramid builds failing with `ENOENT` after tile encoding when a Level output folder did not exist. The rebuild command now creates the parent folder before moving completed tiers out of staging.
+
 ## 1.0.4
 
 - Fixed incorrect release version metadata that prevented versions 1.0.2 and 1.0.3 from publishing.
